@@ -1,0 +1,184 @@
+\documentclass[12pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{mathptmx}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+% Colors for listings
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstset{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+
+% Hyperref setup
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=blue,
+    pdftitle={Layer10 Grounded Memory System},
+}
+
+\title{
+    \vspace{-2cm}
+    \rule{\linewidth}{0.5mm} \\[0.4cm]
+    \Huge \textbf{Layer10 Project Report} \\
+    \Large \textit{Grounded Long-Term Memory via Structured Extraction, Deduplication, and a Context Graph} \\[0.2cm]
+    \rule{\linewidth}{0.5mm}
+}
+\author{System Architecture \& Implementation Report}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report provides a comprehensive technical overview of the Layer10 Grounded Long-Term Memory System. The system orchestrates the extraction, semantic deduplication, and integration of semi-structured factual claims out of the Enron unstructured email corpus. Utilizing local Large Language Models (LLMs via Ollama) and robust fallback rule-based methods, the system transforms raw textual evidence into a high-density, rigorously grounded Knowledge Graph. Distinct features include reversible union-find canonicalization, exact character-level source offsets, temporal conflict resolution, and an immersive visualization web interface.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+The primary goal of this project architectures a ``long-term memory'' module capable of parsing vast streams of interpersonal communication and retaining factual, verifiable structures. The Enron Email dataset is selected due to its inherently noisy, stateful, and conflicting communication patterns over real-world organizational changes.
+
+\subsection{Corpus Selection}
+The system models incoming data through chronological thread boundaries constraints (5 to 15 emails per thread limit). The data layer supports:
+\begin{itemize}
+    \item \textbf{CMU Maildir Extract}: Parses raw `.txt`/`.eml` structures, handling \textit{In-Reply-To} headers to build deep temporal threads.
+    \item \textbf{Synthetic Base}: A hardcoded 75-email fallback ensuring reliable execution when large archives aren't present.
+\end{itemize}
+
+\section{Ontology and Schema Design}
+
+To extract predictable intelligence from chaotic emails, the graph mandates strict schemas modeled in \texttt{Pydantic}. The representation avoids loosely-typed schema definitions to guarantee safe ingestion and merging.
+
+\subsection{Entity Types}
+Entities are the main nodes of the graph. The ontology is constrained to 8 distinct tags:
+\begin{itemize}
+    \item \textbf{Person}: Standard personnel identifiers (e.g., \textit{Kenneth Lay, Jeff Skilling}).
+    \item \textbf{Organisation}: Firms, regulators, market actors (e.g., \textit{Enron, Arthur Andersen}).
+    \item \textbf{FinancialInstrument}: Distinct fiscal mechanisms (e.g., \textit{Raptor, Chewco}).
+    \item \textbf{Event}: Time-bound major occurrences (e.g., \textit{Bankruptcy filing}).
+    \item \textbf{Project}, \textbf{System}, \textbf{Role}, \textbf{Location}.
+\end{itemize}
+
+\subsection{Claim/Relation Modalities}
+All semantic edges connecting Entities are termed \textbf{Claims} and fall under explicit categorizations:
+\begin{enumerate}
+    \item \textit{Organisational}: \texttt{works\_at, has\_role, reports\_to}.
+    \item \textit{Action-based}: \texttt{sent\_email, decided, warned\_about}.
+    \item \textit{Temporal-factual}: \texttt{has\_status, supersedes, related\_to}.
+\end{enumerate}
+
+Every constructed claim retains an absolute validity window governed via \texttt{ClaimStatus} (\textit{current, historical, retracted, disputed}).
+
+\section{Structured Extraction Engine}
+
+Extraction runs incrementally across email threads, checkpointing completions locally.
+
+\subsection{Dual Extraction Strategy}
+The pipeline uses a synthesized two-pass technique:
+\begin{enumerate}
+    \item \textbf{LLM Extraction}: The primary pass calls a local LLM (\texttt{llama3.2:3b} using Ollama) forced via system prompt to yield strict JSON payloads matching Pydantic requirements. Parsing utilizes multiple attempts up to \texttt{MAX\_RETRIES}.
+    \item \textbf{Regex/Rule Fallback}: A deterministic regular expression engine scans for known static dimensions (dollar values, project names, organizational hierarchies) filling gaps invisible to the LLM or standing in for an offline model.
+\end{enumerate}
+
+\subsection{Evidence Grounding and Offsets}
+Unlike standard generation, every entity edge requires justification. This system calculates extreme fidelity constraints:
+\begin{itemize}
+    \item \textbf{Source UUID}: Identifies exact document MD5 hashes.
+    \item \textbf{Verbatim Quoting}: Limited to 300 character excerpts.
+    \item \textbf{Pointer Offsets}: Retains exact \texttt{char\_offset\_start} and \texttt{char\_offset\_end} positions mapping directly back to original byte sequences, ensuring traceability and highlight capability natively in the UI.
+\end{itemize}
+
+\section{Graph Deduplication and Normalization}
+
+The pipeline consolidates duplicated information using a 3-layered consolidation framework. Crucially, all modifications to the network emit a \texttt{MergeRecord} permitting 100\% reversible snapshots.
+
+\subsection{Layer 1: Artifact Deprecation}
+Due to the forwarding nature of email threads, sub-strings are highly repetitive. Artifact Dedup checks content-hashing inside overlapping timestamps to eliminate duplicate LLM calls on identical text blocks.
+
+\subsection{Layer 2: Entity Canonicalization (Union-Find)}
+Implemented across \texttt{03\_dedup.py}:
+\begin{itemize}
+    \item \textbf{Deterministic Matching}: Directly lower-cases properties and string definitions.
+    \item \textbf{Semantic Similarity Embedding}: Within each domain-type, pairs embed using \texttt{all-MiniLM-L6-v2}. Computations generating Cosine Similarity above the 0.85 threshold enact merges.
+    \item \textbf{Disjoint-set structure}: Entities inherit subsets using an amortized $O(\alpha(N))$ graph technique.
+\end{itemize}
+
+\subsection{Layer 3: Resolution and Super-session}
+Redundant facts (Claims) are collapsed temporally via specific keys (`subj|rel|obj`). For conflicting statuses (e.g., transitioning from CFO to CEO), older claims deprecate into \texttt{HISTORICAL} statuses with valid super-session pointer references linking to the current active Claim.
+
+\section{System Architecture Components}
+
+The core architecture operates over interconnected procedural Python layers.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{File / Module} & \textbf{Architectural Responsibility} \\ \midrule
+\texttt{schema.py} & Core Pydantic types, MemoryStore class wrappers. \\
+\texttt{config.py} & Constant limits, path ingestion, threshold bounds. \\
+\texttt{01\_download\_corpus.py} & Ingests external archives, parses to sequential threading. \\
+\texttt{02\_extract.py} & Dispatches generative model extraction and checks offset logic. \\
+\texttt{03\_dedup.py} & Consolidates representations, logs historical \texttt{undo\_merge} events. \\
+\texttt{04\_graph.py} & Serializes optimized states to NetworkX DiGraph storage. \\
+\texttt{06\_app.py} & Bootstraps local web UI (Streamlit \& vis-network). \\
+\bottomrule
+\end{tabular}
+\caption{System Mapping}
+\end{table}
+
+\section{Retrieval and Interface Visualization}
+
+\subsection{Semantic Retrieval Pipeline}
+User promptings are converted into embeddings utilizing SentenceTransformers. Vector comparison isolates related Entity nodes, sequentially executing a 1-hop MultiDiGraph crawl to fetch all correlated Claims. Resulting records are fed alongside original quotes into a context-packing schema dictating explicit factual origins.
+
+\subsection{Streamlit Interactive Platform}
+The visual interface guarantees immediate interactions without heavy frontend stacks:
+\begin{itemize}
+    \item \textbf{Graph Module}: Employs tuned physics logic \texttt{vis-network.js}, utilizing gravitational constant metrics to prohibit node drift while visualizing isolated entity pockets.
+    \item \textbf{Semantic Queries}: Facilitates synthesized text completion powered directly out of constructed Context Packs yielding explicit citations.
+    \item \textbf{Audit Modules}: A `Merges` tab detailing origin snapshots for safe reversal processes ensuring long-term maintenance tracking.
+\end{itemize}
+
+\section{Conclusion}
+
+The resulting Layer10 Graph memory mechanism ensures an uncompromising traceability contract bridging raw organizational activity streams with dense generative insights. Future expansion into broader modalities like Slack/Linear channels involves leveraging similar chronological overlap strategies mapping unique channel IDs against domain organizational ontologies while keeping the exact deterministic rollback mechanisms detailed above.
+
+\end{document}

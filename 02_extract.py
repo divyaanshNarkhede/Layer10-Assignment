@@ -1,16 +1,20 @@
 """
-Step 2 – Structured Extraction Pipeline (thread-wise).
+This is where the actual intelligence extraction happens.
 
-For each *conversation thread*, feeds the full thread to a local LLM
-(via Ollama, GPU-accelerated) to extract typed entities and grounded
-claims.  Includes:
-  • System prompt with explicit JSON schema
-  • Pydantic validation loop with retries
-  • Deterministic rule-based fallback / supplement
-  • Confidence scoring
-  • Version tracking
+For each conversation thread we've assembled, this script sends the
+whole thread to a local LLM (llama3.2:3b via Ollama) and asks it to
+pull out every person, organisation, project, and relationship it can
+find — backed by an exact quote from the emails.
 
-The input format is a list of thread dicts:
+If the LLM is unavailable or keeps returning bad JSON, we fall back
+to a deterministic regex extractor so the pipeline never stalls.
+
+What this produces:
+  - Typed entities (Person, Organisation, Project, etc.)
+  - Grounded claims (subject → relation → object, with a quote and confidence)
+  - Char offsets so we know exactly where in the email the quote lives
+
+Input format:
     { thread_id, subject, messages: [{email_id, from, to, ...}], ... }
 """
 import json, os, sys, hashlib, time, re
@@ -26,7 +30,7 @@ from schema import (
     RelationType, ExtractionResult
 )
 
-# ─── Try to import ollama; provide fallback ──────────────────────────────────
+# ── Try to load Ollama — if it's not installed or disabled, we'll use the regex fallback
 try:
     if os.environ.get("DISABLE_OLLAMA"):
         raise ImportError("Ollama disabled via DISABLE_OLLAMA env var")
@@ -95,7 +99,7 @@ Subject: {subject}
 """
 
 
-# ─── Prompt Hash ─────────────────────────────────────────────────────────────
+# ── Hash the system prompt so we can track which prompt version produced each extraction
 PROMPT_HASH = hashlib.md5(SYSTEM_PROMPT.encode()).hexdigest()[:8]
 
 
@@ -136,8 +140,8 @@ def call_ollama(thread_data: dict) -> str | None:
             options={
                 "temperature": 0.1,
                 "num_predict": 2048,
-                "num_gpu": 99,         # offload all layers to GPU
-                "num_ctx": 4096,       # fits in 6GB VRAM with 3B model
+                "num_gpu": 99,         # push everything to the GPU if available
+                "num_ctx": 4096,       # 4k context fits comfortably in 6GB VRAM with the 3B model
             },
             keep_alive="10m",
         )
@@ -150,15 +154,15 @@ def call_ollama(thread_data: dict) -> str | None:
 
 
 def parse_llm_json(raw: str) -> dict | None:
-    """Best-effort extraction of JSON from LLM output."""
+    """Tries several strategies to pull valid JSON out of the LLM's raw response."""
     if not raw:
         return None
-    # Try direct parse
+    # First, try parsing it directly — most of the time this just works
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # Try to find JSON block
+    # The LLM sometimes wraps the JSON in markdown fences — strip those and retry
     patterns = [
         r'```json\s*(.*?)\s*```',
         r'```\s*(.*?)\s*```',
@@ -175,7 +179,7 @@ def parse_llm_json(raw: str) -> dict | None:
 
 
 def normalize_entity_type(raw_type: str) -> EntityType:
-    """Map raw string to EntityType enum, with fallback."""
+    """Turns whatever string the LLM returned into a proper EntityType, with a safe fallback."""
     mapping = {
         "person": EntityType.PERSON,
         "organisation": EntityType.ORGANISATION,
@@ -193,7 +197,7 @@ def normalize_entity_type(raw_type: str) -> EntityType:
 
 
 def normalize_relation(raw_rel: str) -> RelationType:
-    """Map raw string to RelationType enum."""
+    """Converts the LLM's relation string into a RelationType enum value, or falls back to related_to."""
     raw_rel = raw_rel or "related_to"
     try:
         return RelationType(raw_rel.lower().strip())
@@ -205,10 +209,10 @@ def normalize_relation(raw_rel: str) -> RelationType:
 
 
 def build_extraction(thread_data: dict, parsed: dict) -> ExtractionResult:
-    """Convert parsed LLM JSON into validated Pydantic models."""
+    """Takes the raw dict from the LLM and turns it into proper typed Pydantic models."""
     thread_id = thread_data.get("thread_id", "")
     messages = thread_data.get("messages", [])
-    # Build a map of email_ids for evidence lookup
+    # Index messages by email_id so we can quickly find the source email for each claim
     msg_map = {m["email_id"]: m for m in messages}
     first_ts = messages[0].get("timestamp", "") if messages else ""
     last_ts = messages[-1].get("timestamp", "") if messages else ""
@@ -250,7 +254,7 @@ def build_extraction(thread_data: dict, parsed: dict) -> ExtractionResult:
         quote = (raw_claim.get("quote") or "")[:300]
         ev_email_id = raw_claim.get("email_id", thread_id)
 
-        # Resolve entity IDs (create if not found)
+        # Look up both entity IDs — create placeholder entities if the LLM named something new
         subj_id = entity_name_to_id.get(subj_name.lower(), "")
         obj_id = entity_name_to_id.get(obj_name.lower(), "")
 
@@ -268,16 +272,16 @@ def build_extraction(thread_data: dict, parsed: dict) -> ExtractionResult:
             entity_name_to_id[obj_name.lower()] = ent.id
             obj_id = ent.id
 
-        # Find evidence context from the referenced email
+        # Grab the actual email the LLM cited as its evidence source
         ev_msg = msg_map.get(ev_email_id, messages[0] if messages else {})
         ev_body = ev_msg.get("body", "")
 
-        # Compute char offsets for the quote within the email body
+        # Find exactly where in the email body the quote appears so we can store precise offsets
         offset_start, offset_end = None, None
         if quote and ev_body:
             idx = ev_body.find(quote)
             if idx == -1:
-                # Try case-insensitive fallback
+                # Case-sensitive search failed — try a relaxed case-insensitive search
                 idx = ev_body.lower().find(quote.lower()[:80])
             if idx >= 0:
                 offset_start = idx

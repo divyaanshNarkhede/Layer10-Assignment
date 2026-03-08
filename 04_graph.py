@@ -1,11 +1,13 @@
 """
-Step 4 – Memory Graph Design.
+Takes the deduplicated entities and claims and builds a proper graph.
 
-Builds a NetworkX MultiDiGraph:
-  • Nodes  = canonical Entities (with attributes)
-  • Edges  = Claims (with Evidence as edge data)
+We use NetworkX's MultiDiGraph because two entities can have more than
+one relationship between them at the same time (e.g. a person can both
+work_at and has_role at the same org). Each edge carries the full claim
+data including all its evidence.
 
-Also provides serialisation to/from JSON for persistence.
+Also computes some useful stats (top entities, coverage %, etc.) and
+writes everything to output/memory_graph.json.
 """
 import json, os, sys
 import networkx as nx
@@ -24,10 +26,10 @@ def build_graph(
     claims: list[Claim],
     merge_log: list[MergeRecord],
 ) -> nx.MultiDiGraph:
-    """Build the memory graph from canonical entities and claims."""
+    """Converts the entity and claim lists into a NetworkX MultiDiGraph."""
     G = nx.MultiDiGraph()
 
-    # Add entity nodes
+    # Each entity becomes a node — we store all its attributes on the node
     for ent in entities:
         G.add_node(ent.id, **{
             "name": ent.name,
@@ -38,9 +40,9 @@ def build_graph(
             "metadata": ent.metadata,
         })
 
-    # Add claim edges
+    # Each claim becomes a directed edge — if either endpoint is missing, add it as a stub
     for claim in claims:
-        # Ensure both nodes exist
+        # Safety check: make sure both endpoints exist before drawing the edge
         if claim.subject_id not in G:
             G.add_node(claim.subject_id, name=claim.subject_name, type="Unknown")
         if claim.object_id not in G:
@@ -70,32 +72,32 @@ def build_graph(
 
 
 def graph_stats(G: nx.MultiDiGraph) -> dict:
-    """Compute summary statistics for the memory graph."""
-    # Node type distribution
+    """Computes a summary of the graph — useful for the Stats page and sanity checks."""
+    # Count how many nodes we have of each entity type
     type_dist = {}
     for _, data in G.nodes(data=True):
         t = data.get("type", "Unknown")
         type_dist[t] = type_dist.get(t, 0) + 1
 
-    # Relation type distribution
+    # Count how often each relation type appears
     rel_dist = {}
     for _, _, data in G.edges(data=True):
         r = data.get("relation", "unknown")
         rel_dist[r] = rel_dist.get(r, 0) + 1
 
-    # Status distribution
+    # Break down claims by their status (current, historical, etc.)
     status_dist = {}
     for _, _, data in G.edges(data=True):
         s = data.get("status", "unknown")
         status_dist[s] = status_dist.get(s, 0) + 1
 
-    # Top entities by degree
+    # Find the most connected entities — these are usually the key players
     top_entities = sorted(
         [(n, G.degree(n), G.nodes[n].get("name", n)) for n in G.nodes()],
         key=lambda x: x[1], reverse=True
     )[:15]
 
-    # Evidence coverage
+    # How many claims actually have evidence backing them up?
     total_evidence = sum(
         data.get("evidence_count", 0) for _, _, data in G.edges(data=True)
     )

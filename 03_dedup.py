@@ -1,13 +1,18 @@
 """
-Step 3 – Deduplication and Canonicalization.
+The deduplication step — this is where we clean up all the redundancy.
 
-Three layers of dedup:
-  1. Artifact dedup   – near-identical emails (quoting/forwarding)
-  2. Entity dedup     – exact match + semantic similarity (Union-Find)
-  3. Claim dedup      – merge claims with same (subject, relation, object)
+After extraction, we end up with hundreds of near-identical entities
+("K. Lay", "Kenneth Lay", "Ken Lay") and duplicate claims from the
+same fact appearing across multiple threads. This step collapses all
+of that into one clean canonical graph.
 
-All merges are logged in MergeRecord with pre-merge snapshots for undo.
-OOP Deduplicator class wraps all logic.
+Three layers, applied in order:
+  1. Artifact dedup  – merge extractions from near-identical forwarded emails
+  2. Entity dedup    – exact string match, then semantic similarity via embeddings
+  3. Claim dedup     – merge identical (subject, relation, object) triples,
+                       and mark older role/status claims as historical
+
+Every merge is logged with a before/after snapshot so it can be undone.
 """
 import json, os, sys, copy
 from collections import defaultdict
@@ -23,7 +28,7 @@ from schema import (
     ExtractionResult, MergeRecord, MemoryStore
 )
 
-# ─── Lazy-load sentence-transformers ─────────────────────────────────────────
+# ── Only load the embedding model when we actually need it — it's slow to import
 _embedding_model = None
 
 def get_embedding_model():
@@ -41,9 +46,7 @@ def cosine_sim(a, b) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Union-Find for entity merging
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Union-Find data structure for tracking which entities have been merged ────
 class UnionFind:
     def __init__(self):
         self.parent = {}
@@ -64,11 +67,9 @@ class UnionFind:
         return False
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Layer 1: Artifact Dedup (email-level)
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Layer 1: Drop extractions from emails we've already seen ────────────────
 def dedup_artifacts(extractions: list[ExtractionResult]) -> list[ExtractionResult]:
-    """Remove extractions from near-duplicate emails (forwarded/quoted)."""
+    """Merges extractions that came from near-identical emails (e.g. the same email forwarded twice)."""
     seen_bodies = {}
     deduped = []
     duplicates = 0
@@ -107,9 +108,7 @@ def dedup_artifacts(extractions: list[ExtractionResult]) -> list[ExtractionResul
     return deduped
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Layer 2: Entity Canonicalization
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Layer 2: Merge entities that refer to the same real-world thing ─────────
 def canonicalize_entities(
     all_entities: list[Entity],
 ) -> tuple[list[Entity], dict[str, str], list[MergeRecord]]:
@@ -123,17 +122,17 @@ def canonicalize_entities(
     merge_log = []
     uf = UnionFind()
 
-    # Group by canonical_key for exact match
+    # First group everything by its canonical key (lowercased name + type)
     key_to_entities: dict[str, list[Entity]] = defaultdict(list)
     for ent in all_entities:
         key_to_entities[ent.canonical_key()].append(ent)
 
-    # Phase 1: Exact match merges
+    # Phase 1: Merge anything with an identical name and type
     canonical_map: dict[str, Entity] = {}
     for key, group in key_to_entities.items():
         winner = group[0]
         for other in group[1:]:
-            # Snapshot before merge for undo support
+            # Save the state of both sides before we modify anything — needed for undo
             winner_snap = winner.model_dump()
             loser_snap = other.model_dump()
 
@@ -144,7 +143,7 @@ def canonicalize_entities(
                     winner.aliases.append(alias)
             if other.name not in winner.aliases and other.name != winner.name:
                 winner.aliases.append(other.name)
-            # Update time range
+            # Expand the winner's time window to cover the loser's dates too
             if other.first_seen and (not winner.first_seen or other.first_seen < winner.first_seen):
                 winner.first_seen = other.first_seen
             if other.last_seen and (not winner.last_seen or other.last_seen > winner.last_seen):
@@ -162,7 +161,7 @@ def canonicalize_entities(
             ))
         canonical_map[key] = winner
 
-    # Phase 2: Semantic similarity (within same EntityType)
+    # Phase 2: For anything that didn't match exactly, try embedding similarity
     canonical_list = list(canonical_map.values())
     type_groups: dict[EntityType, list[Entity]] = defaultdict(list)
     for ent in canonical_list:
@@ -181,7 +180,7 @@ def canonicalize_entities(
                 if sim >= SIMILARITY_THRESHOLD:
                     winner, loser = group[i], group[j]
                     if uf.union(winner.id, loser.id):
-                        # Snapshot before merge
+                        # Capture both sides before touching anything so we can undo this later
                         winner_snap = winner.model_dump()
                         loser_snap = loser.model_dump()
 
@@ -198,9 +197,9 @@ def canonicalize_entities(
                             },
                         ))
 
-    # Build final canonical entity list and ID remap
+    # Build the final list and a mapping from old IDs to canonical IDs
     id_to_entity = {e.id: e for e in canonical_list}
-    # Also index all entities so we can resolve any Union-Find root
+    # We need to be able to resolve any entity ID back to its canonical root
     all_entity_by_id = {e.id: e for e in all_entities}
     final_entities = {}
     id_remap = {}
@@ -219,9 +218,7 @@ def canonicalize_entities(
     return list(final_entities.values()), id_remap, merge_log
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Layer 3: Claim Dedup + Conflict Resolution
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Layer 3: Merge duplicate claims and handle conflicting facts over time ────
 def dedup_claims(
     all_claims: list[Claim],
     id_remap: dict[str, str],
@@ -233,12 +230,12 @@ def dedup_claims(
     """
     merge_log = []
 
-    # Remap IDs
+    # First, rewrite all subject/object IDs to point to canonical entities
     for claim in all_claims:
         claim.subject_id = id_remap.get(claim.subject_id, claim.subject_id)
         claim.object_id = id_remap.get(claim.object_id, claim.object_id)
 
-    # Group by canonical key
+    # Group claims that say the same thing (same subject, relation, and object)
     key_to_claims: dict[str, list[Claim]] = defaultdict(list)
     for claim in all_claims:
         key = claim.canonical_key()
@@ -250,17 +247,17 @@ def dedup_claims(
             final_claims.append(group[0])
             continue
 
-        # Sort by timestamp (earliest first)
+        # Put them in chronological order so the newest one becomes the winner
         group.sort(key=lambda c: c.valid_from or "")
 
-        # Winner = most recent, with all evidence merged
+        # Keep the most recent claim and fold all the evidence from older ones into it
         winner = group[-1]  # latest timestamp
         for older in group[:-1]:
-            # Snapshot before merge
+            # Snapshot both sides before we change anything
             winner_snap = winner.model_dump()
             older_snap = older.model_dump()
 
-            # Merge evidence
+            # Fold in any evidence the older claim had that the winner doesn't
             existing_fps = {e.fingerprint() for e in winner.evidence}
             for ev in older.evidence:
                 if ev.fingerprint() not in existing_fps:
@@ -282,7 +279,7 @@ def dedup_claims(
 
         final_claims.append(winner)
 
-    # Conflict detection: look for contradicting status claims
+    # Now handle temporal conflicts — same person, different role at different times
     status_claims = [c for c in final_claims if c.relation.value in ("has_status", "has_role")]
     subj_status: dict[str, list[Claim]] = defaultdict(list)
     for c in status_claims:
@@ -315,7 +312,7 @@ def dedup_claims(
                     },
                 ))
 
-    # Quality gate: filter low-confidence claims
+    # Drop anything below the confidence threshold — it's more noise than signal
     before_filter = len(final_claims)
     final_claims = [c for c in final_claims if c.confidence >= CONFIDENCE_THRESHOLD]
     filtered = before_filter - len(final_claims)
@@ -327,13 +324,11 @@ def dedup_claims(
     return final_claims, merge_log
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# OOP Deduplicator class
-# ═════════════════════════════════════════════════════════════════════════════
+# ── A clean class wrapper around the whole dedup pipeline ───────────────────
 class Deduplicator:
     """
-    OOP wrapper around the dedup pipeline.
-    Provides run_full_pipeline(), undo_merge(), orphan cleanup.
+    Wraps all three dedup layers into a single object you can run
+    and inspect. Also handles orphan cleanup and saving results.
     """
 
     def __init__(self, extractions: list[ExtractionResult]):
@@ -344,11 +339,11 @@ class Deduplicator:
         self.id_remap: dict[str, str] = {}
 
     def run_full_pipeline(self) -> "Deduplicator":
-        """Execute all three dedup layers in sequence."""
-        # Layer 1: Artifact dedup
+        """Runs all three dedup layers in order and returns self for chaining."""
+        # Start with artifact dedup — collapse near-identical forwarded emails
         self.extractions = dedup_artifacts(self.extractions)
 
-        # Flatten
+        # Flatten everything into two big lists before the entity/claim passes
         all_entities = []
         all_claims = []
         for ext in self.extractions:
@@ -357,15 +352,15 @@ class Deduplicator:
 
         print(f"\n  Raw totals: {len(all_entities)} entities, {len(all_claims)} claims")
 
-        # Layer 2: Entity canonicalization
+        # Merge entities that refer to the same person/org/project
         self.entities, self.id_remap, entity_merges = canonicalize_entities(all_entities)
 
-        # Layer 3: Claim dedup + conflict resolution
+        # Merge duplicate claims and mark superseded ones as historical
         self.claims, claim_merges = dedup_claims(all_claims, self.id_remap)
 
         self.merge_log = entity_merges + claim_merges
 
-        # Layer 4: Orphan cleanup
+        # Remove any entities that ended up with no claims pointing to them
         self._cleanup_orphans()
 
         print(f"\n  Final: {len(self.entities)} entities, {len(self.claims)} claims")
@@ -374,7 +369,7 @@ class Deduplicator:
         return self
 
     def _cleanup_orphans(self) -> int:
-        """Remove entities not referenced by any claim."""
+        """Deletes any entities that no claim references — they'd just be floating noise."""
         referenced = set()
         for c in self.claims:
             referenced.add(c.subject_id)
@@ -387,7 +382,7 @@ class Deduplicator:
         return removed
 
     def to_memory_store(self) -> MemoryStore:
-        """Convert results to a MemoryStore container."""
+        """Packages up the dedup results into a MemoryStore ready for graph building."""
         store = MemoryStore()
         for e in self.entities:
             store.add_entity(e)
@@ -397,7 +392,7 @@ class Deduplicator:
         return store
 
     def save(self, output_dir: str = OUTPUT_DIR) -> str:
-        """Save dedup results to JSON."""
+        """Writes the deduped entities, claims, and merge log to output/deduped.json."""
         output = {
             "entities": [e.model_dump() for e in self.entities],
             "claims": [c.model_dump() for c in self.claims],
@@ -411,18 +406,16 @@ class Deduplicator:
         return dedup_path
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Undo merge
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Undo a specific merge by restoring both sides from their snapshots ───────
 def undo_merge(
     store: MemoryStore,
     merge_id: str,
 ) -> bool:
     """
-    Reverse a single merge using its stored snapshots.
-    Returns True if successful, False if not found or not reversible.
+    Reverses a single merge operation using the before/after snapshots stored
+    in the MergeRecord. Returns True on success, False if it can't be undone.
     """
-    # Find the merge record
+    # Search the merge log for the record with this ID
     target: MergeRecord | None = None
     target_idx: int = -1
     for i, m in enumerate(store.merge_log):
@@ -473,27 +466,25 @@ def undo_merge(
         winner_claim = Claim(**winner_data)
         loser_claim = Claim(**loser_data)
 
-        # Restore the winner to its pre-merge state
+        # Restore the winner claim to its pre-merge state
         store.claims[winner_claim.id] = winner_claim
-        # Re-add the loser claim
+        # Bring the loser claim back as well
         store.claims[loser_claim.id] = loser_claim
 
-    # Remove the merge record from the log
+    # Remove the merge record itself so the audit log stays accurate
     store.merge_log.pop(target_idx)
     print(f"  undo_merge: successfully reversed {target.merge_type} merge {merge_id}")
     return True
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Main orchestration (backward-compatible wrapper)
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Top-level runner — called by run_pipeline.py or directly via __main__ ────
 def run_dedup(extraction_path: str = EXTRACTION_PATH):
-    """Full deduplication pipeline."""
+    """Loads extractions from disk and runs the full dedup pipeline."""
     print("=" * 60)
     print("Layer10 Memory Pipeline - Deduplication & Canonicalization")
     print("=" * 60)
 
-    # Load extractions
+    # Pull the raw extractions that 02_extract.py produced
     with open(extraction_path) as f:
         raw = json.load(f)
 

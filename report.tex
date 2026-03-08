@@ -1,6 +1,6 @@
 \documentclass[12pt,a4paper]{article}
 
-% Packages
+% ─── Packages ───────────────────────────────────────────────────────────────
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{mathptmx}
@@ -9,12 +9,761 @@
 \usepackage{hyperref}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{longtable}
 \usepackage{float}
 \usepackage{listings}
 \usepackage{xcolor}
 \usepackage{enumitem}
 \usepackage{titlesec}
 \usepackage{parskip}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tcolorbox}
+\tcbuselibrary{breakable, skins}
+
+% ─── Code listing style ──────────────────────────────────────────────────────
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.38,0,0.72}
+\definecolor{backcolour}{rgb}{0.96,0.96,0.94}
+\definecolor{keyblue}{rgb}{0.13,0.37,0.68}
+
+\lstdefinestyle{pythonstyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen}\itshape,
+    keywordstyle=\color{keyblue}\bfseries,
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=6pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    frame=single,
+    rulecolor=\color{codegray},
+}
+\lstdefinestyle{bashstyle}{
+    backgroundcolor=\color{black!92},
+    basicstyle=\ttfamily\footnotesize\color{white},
+    breaklines=true,
+    frame=single,
+    rulecolor=\color{black},
+    numbers=none,
+}
+\lstset{style=pythonstyle}
+
+% ─── Hyperref setup ──────────────────────────────────────────────────────────
+\hypersetup{
+    colorlinks=true,
+    linkcolor=keyblue,
+    filecolor=magenta,
+    urlcolor=keyblue,
+    pdftitle={Layer10 Grounded Memory System – Full Technical Report},
+    pdfauthor={Divyaansh Narkhede},
+}
+
+% ─── Title ───────────────────────────────────────────────────────────────────
+\title{
+    \vspace{-2cm}
+    \rule{\linewidth}{0.8mm} \\[0.5cm]
+    {\Huge \textbf{Layer10 Project Report}} \\[0.3cm]
+    {\large \textit{Grounded Long-Term Memory via Structured Extraction,\\
+    Union-Find Deduplication, and a Context Knowledge Graph}} \\[0.3cm]
+    \rule{\linewidth}{0.8mm}
+}
+\author{
+    \textbf{Divyaansh Narkhede} \\
+    \textbf{Roll No. : 24B091} \\
+    System Architecture \& Implementation Report
+}
+\date{March 2026}
+
+% ─── Document ────────────────────────────────────────────────────────────────
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+\noindent
+This report presents a comprehensive technical examination of the \textbf{Layer10 Grounded Long-Term Memory System} — a fully local, privacy-preserving pipeline that converts an unstructured email corpus into a rigorously evidenced knowledge graph. The system combines a local Large Language Model (\texttt{llama3.2:3b} via Ollama) with deterministic rule-based fallback extractors to produce typed entities and evidenced relational claims. These raw extractions are progressively refined through a three-layer deduplication framework: content-hash artifact elimination, Union-Find entity canonicalization backed by \texttt{all-MiniLM-L6-v2} semantic embeddings, and temporal claim super-session. The final graph is serialized as a NetworkX \texttt{MultiDiGraph} and exposed via an interactive Streamlit application featuring an embedded \texttt{vis-network.js} physics visualization, semantic retrieval, and a full merge-audit trail. Every design decision prioritizes \textit{grounded retrieval}: no claim exists in the graph without a verbatim evidence pointer storing exact character offsets back to the originating email byte sequence.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction and Motivation}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Modern Large Language Models lack persistent, verifiable memory. When facts change — a person's role, a project's status, a financial instrument's value — the model has no mechanism to record the transition, cite the source, or resolve the conflict. The Layer10 system is built to solve this problem for a realistic, deeply noisy corpus: the Enron email archive.
+
+The core thesis is that a \textit{grounded} memory graph — one where every node and every edge is anchored to an exact textual excerpt at a precise byte offset — is fundamentally more trustworthy than either a raw vector store (which loses structure) or a generic knowledge graph (which loses provenance). Layer10 enforces this contract at every stage of the pipeline.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{The Enron Email Dataset}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The \textbf{Enron Email Corpus} is a canonical NLP and network-analysis benchmark. It was made public by the U.S.\ Federal Energy Regulatory Commission (FERC) during its investigation into Enron Corporation's 2001 bankruptcy, one of the largest corporate collapses in history. Key statistics:
+
+\begin{itemize}
+    \item \textbf{$\approx$\,500,000 messages} authored by \textbf{$\approx$\,150 senior employees}.
+    \item Date range spanning \textbf{1999–2002}, covering the full arc from growth to collapse.
+    \item Messages distributed across \textbf{158 named mailbox directories} in the CMU Maildir format.
+    \item The corpus has been used in fraud detection, social network analysis, authorship attribution, and information extraction research.
+\end{itemize}
+
+For Layer10, the Enron dataset provides three categories of challenge that stress-test every component:
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Dynamic Organizational Hierarchy}: Promotions (e.g.\ Jeff Skilling from President to CEO), role changes, and reporting reassignments create \textit{temporal conflicts} that test the system's claim super-session logic. A fact that was \texttt{CURRENT} in January 2001 may be \texttt{HISTORICAL} by April.
+    \item \textbf{Non-Standard Domain Entities}: The corpus is dense with proprietary terminology — special purpose vehicles (\textit{Raptor~I/II/III/IV}, \textit{Chewco}, \textit{LJM Cayman}), internal systems (\textit{EnronOnline}, \textit{RiskTrak}), and projects (\textit{Broadband}) — that do not appear in pre-trained model vocabularies and require custom ontologies.
+    \item \textbf{Extreme Conversational Noise}: Deeply nested forward/reply chains (\texttt{>~>~>}), mixed encodings, legal disclaimers repeated in every email, and varying date formats (RFC~2822 mixed with informal styles) challenge the artifact deduplication and evidence grounding layers specifically.
+\end{enumerate}
+
+\begin{tcolorbox}[title=Dataset Sourcing, colback=blue!5, colframe=keyblue, breakable]
+The system reads the CMU Maildir directly from \texttt{data/maildir/} (subdirectory per user). Thread reconstruction uses the RFC~2822 \texttt{In-Reply-To}, \texttt{References}, and \texttt{Message-ID} headers. When the full archive is unavailable, a hardcoded synthetic corpus of \textbf{75 emails} across structured threads is used as a deterministic fallback, producing reproducible test graphs.
+\end{tcolorbox}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{System Goals and Design Principles}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{enumerate}[label=\textbf{G\arabic*.}]
+    \item \textbf{Grounded provenance}: every claim stores a verbatim quote $\leq$\,300 characters and exact character offsets \texttt{(char\_offset\_start, char\_offset\_end)}.
+    \item \textbf{Fully local execution}: Ollama serves the LLM at \texttt{localhost:11434}; no data leaves the machine.
+    \item \textbf{Reversibility}: all merges emit a \texttt{MergeRecord} containing pre-merge snapshots, enabling lossless undo.
+    \item \textbf{Incremental resumability}: each pipeline stage checkpoints its output to \texttt{output/}; a crash can resume from the last saved state.
+    \item \textbf{Strict typing}: all inter-module data is validated via Pydantic~v2 models; no untyped dicts cross module boundaries.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Ontology and Schema Design (\texttt{schema.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+All data structures are defined in \texttt{schema.py} as Pydantic~v2 \texttt{BaseModel} subclasses. This single-source-of-truth design guarantees that the LLM, the deduplicator, the graph builder, and the UI all operate on identical validated objects.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Entity Model}
+% ─────────────────────────────────────────────────────────────────────────────
+
+An \texttt{Entity} represents a canonical node in the knowledge graph. The ontology is intentionally constrained to \textbf{eight types} (via \texttt{EntityType} enum) to prevent schema drift while covering all meaningful Enron domain concepts:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Type} & \textbf{Example} & \textbf{Purpose} \\ \midrule
+\texttt{Person} & \textit{Kenneth Lay, Jeff Skilling} & Personnel, executives \\
+\texttt{Organisation} & \textit{Enron, Arthur Andersen, FERC} & Firms, regulators, counterparties \\
+\texttt{FinancialInstrument} & \textit{Raptor, Chewco, LJM Cayman} & SPEs, funds, instruments \\
+\texttt{Event} & \textit{Bankruptcy filing, Board Meeting} & Bounded occurrences \\
+\texttt{Project} & \textit{EnronOnline, Broadband} & Internal initiatives \\
+\texttt{System} & \textit{RiskTrak, SAP} & Software / IT platforms \\
+\texttt{Role} & \textit{CEO, CFO, Treasurer} & Organisational positions \\
+\texttt{Location} & \textit{Houston, Portland} & Geographic entities \\
+\bottomrule
+\end{tabular}
+\caption{Entity type ontology with Enron-domain examples}
+\end{table}
+
+Key fields on the \texttt{Entity} model:
+
+\begin{lstlisting}[caption=Entity model excerpt (schema.py)]
+class Entity(BaseModel):
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    name: str
+    type: EntityType
+    aliases: list[str] = Field(default_factory=list)
+    first_seen: Optional[str] = None
+    last_seen:  Optional[str] = None
+    metadata:   dict = Field(default_factory=dict)
+
+    def canonical_key(self) -> str:
+        return f"{self.type.value}::{self.name.lower().strip()}"
+\end{lstlisting}
+
+The \texttt{canonical\_key()} method forms the basis for Layer~2 exact-match deduplication: two entities sharing the same lowercased name and type will collapse into one regardless of their \texttt{id}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Evidence and Grounding}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Every claim is anchored by one or more \texttt{Evidence} objects:
+
+\begin{lstlisting}[caption=Evidence model (schema.py)]
+class Evidence(BaseModel):
+    source_id:          str             # email_id (unique per message)
+    excerpt:            str             # verbatim quote, <= 300 chars
+    timestamp:          Optional[str]   # ISO-8601 event time
+    source_type:        str = "email"
+    author:             Optional[str]
+    subject:            Optional[str]
+    char_offset_start:  Optional[int]   # byte offset in source
+    char_offset_end:    Optional[int]   # byte offset in source
+
+    def fingerprint(self) -> str:
+        raw = f"{self.source_id}|{self.excerpt[:100]}"
+        return hashlib.md5(raw.encode()).hexdigest()
+\end{lstlisting}
+
+The pair \texttt{(char\_offset\_start, char\_offset\_end)} makes every evidence pointer a deterministic \textit{bookmark} into the raw email body. The \texttt{fingerprint()} method is used to deduplicate identical evidence objects that appear when the same email is processed in multiple threads.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Claim Model}
+% ─────────────────────────────────────────────────────────────────────────────
+
+A \texttt{Claim} is a typed, evidenced, time-bounded assertion linking two entities. Unlike a simple RDF triple, it carries rich temporal and provenance metadata:
+
+\begin{lstlisting}[caption=Claim model (schema.py)]
+class Claim(BaseModel):
+    id:           str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    subject_id:   str;   subject_name: str
+    relation:     RelationType
+    object_id:    str;   object_name:  str
+    confidence:   float = Field(ge=0.0, le=1.0, default=0.8)
+    status:       ClaimStatus = ClaimStatus.CURRENT
+    evidence:     list[Evidence] = Field(default_factory=list)
+    valid_from:   Optional[str] = None
+    valid_until:  Optional[str] = None   # set when superseded
+    superseded_by:Optional[str] = None   # claim id of replacement
+
+    def canonical_key(self) -> str:
+        return (f"{self.subject_name.lower().strip()}|"
+                f"{self.relation.value}|"
+                f"{self.object_name.lower().strip()}")
+\end{lstlisting}
+
+\textbf{Relation types} are organized into four semantic groups across the \texttt{RelationType} enum (25 values):
+
+\begin{itemize}
+    \item \textit{Organizational}: \texttt{works\_at}, \texttt{has\_role}, \texttt{reports\_to}, \texttt{manages}, \texttt{member\_of}
+    \item \textit{Actions}: \texttt{created}, \texttt{sent\_email}, \texttt{decided}, \texttt{proposed}, \texttt{approved}, \texttt{rejected}, \texttt{warned\_about}, \texttt{investigated}
+    \item \textit{States/Facts}: \texttt{has\_status}, \texttt{has\_value}, \texttt{depends\_on}, \texttt{conflicts\_with}, \texttt{supersedes}, \texttt{related\_to}
+    \item \textit{Financial}: \texttt{invested\_in}, \texttt{profited\_from}, \texttt{owes}, \texttt{acquired}
+\end{itemize}
+
+\texttt{ClaimStatus} governs the temporal lifecycle:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Status} & \textbf{Semantics} \\ \midrule
+\texttt{CURRENT}    & The assertion is the most recently confirmed truth. \\
+\texttt{HISTORICAL} & Superseded by a newer claim; \texttt{superseded\_by} points to the replacement. \\
+\texttt{RETRACTED}  & The source email was deleted, redacted, or explicitly withdrawn. \\
+\texttt{DISPUTED}   & Conflicting evidence exists; the claim's confidence is penalized. \\
+\bottomrule
+\end{tabular}
+\caption{ClaimStatus lifecycle}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{MergeRecord and Reversibility}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Every structural mutation to the graph emits a \texttt{MergeRecord}:
+
+\begin{lstlisting}[caption=MergeRecord model (schema.py)]
+class MergeRecord(BaseModel):
+    id:          str
+    merge_type:  str       # "entity" or "claim"
+    winner_id:   str
+    loser_id:    str
+    reason:      str       # e.g. "exact_match" or "semantic_similarity=0.93"
+    timestamp:   str
+    reversible:  bool = True
+    original_snapshots: dict  # pre-merge JSON snapshots of winner + loser
+\end{lstlisting}
+
+Because \texttt{original\_snapshots} stores the full pre-merge state of both participants, any merge can be replayed in reverse: restore the loser entity, update all \texttt{subject\_id}/\texttt{object\_id} references, and delete the merge record. The UI exposes this trail in the ``Merges'' audit tab.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{MemoryStore Container}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\texttt{MemoryStore} is the first-class container exposing indexed access, helpers, and serialization for the entire graph state:
+
+\begin{itemize}
+    \item Entities and Claims are stored as \texttt{dict[str, Entity/Claim]} keyed by ID — $O(1)$ lookups.
+    \item \texttt{find\_entities\_by\_name()} performs case-insensitive substring search over both canonical name and alias pool.
+    \item \texttt{get\_claims\_for\_entity()} and \texttt{get\_claims\_between()} support focused graph traversal without loading the full NetworkX structure.
+    \item \texttt{remove\_orphan\_entities()} prunes nodes unreferenced by any claim, keeping the graph clean after merges.
+    \item \texttt{to\_snapshot()} / \texttt{from\_snapshot()} serialize to/from the flat \texttt{MemoryGraphSnapshot} format for JSON persistence.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Configuration Layer (\texttt{config.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+All tunable parameters and path constants live in \texttt{config.py}, imported by every stage. Critical values:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Constant} & \textbf{Value} & \textbf{Effect} \\ \midrule
+\texttt{OLLAMA\_MODEL} & \texttt{llama3.2:3b} & Generative model for extraction \\
+\texttt{OLLAMA\_HOST} & \texttt{http://localhost:11434} & Local REST endpoint \\
+\texttt{EMBEDDING\_MODEL} & \texttt{all-MiniLM-L6-v2} & Entity similarity embeddings \\
+\texttt{SIMILARITY\_THRESHOLD} & \texttt{0.85} & Cosine threshold for entity merge \\
+\texttt{MAX\_RETRIES} & \texttt{3} & JSON repair attempts per thread \\
+\texttt{CONFIDENCE\_THRESHOLD} & \texttt{0.5} & Minimum confidence to retain a claim \\
+\texttt{BATCH\_SIZE} & \texttt{5} & Emails per inference batch \\
+\texttt{MIN\_MESSAGES\_PER\_THREAD} & \texttt{5} & Thread floor (context richness) \\
+\texttt{MAX\_MESSAGES\_PER\_THREAD} & \texttt{15} & Thread ceiling (context window guard) \\
+\texttt{TARGET\_THREAD\_COUNT} & \texttt{15} & Threads submitted to extraction \\
+\bottomrule
+\end{tabular}
+\caption{Key configuration constants and their pipeline roles}
+\end{table}
+
+The module also calls \texttt{os.makedirs(DATA\_DIR, exist\_ok=True)} and \texttt{os.makedirs(OUTPUT\_DIR, exist\_ok=True)}, guaranteeing that the \texttt{data/} and \texttt{output/} directories are created on first import — eliminating setup friction.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Corpus Ingestion (\texttt{01\_download\_corpus.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The ingestion stage transforms raw email files into a list of \textbf{conversation threads}, each bounded by \texttt{[MIN, MAX]\_MESSAGES\_PER\_THREAD}. The output is \texttt{data/enron\_raw\_emails.json}.
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Maildir Walk}: Recursively walks \texttt{data/maildir/} collecting all \texttt{.txt} files.
+    \item \textbf{RFC~2822 Parse}: Each file is parsed for the standard headers: \texttt{Message-ID}, \texttt{In-Reply-To}, \texttt{References}, \texttt{From}, \texttt{To}, \texttt{Date}, \texttt{Subject}, plus the raw body after the double-CRLF boundary.
+    \item \textbf{Thread Assembly}: A parent-map is built from \texttt{In-Reply-To} pointers. Emails are clustered into trees; each tree becomes a thread. Threads outside the \texttt{[MIN, MAX]} bounds are discarded.
+    \item \textbf{Body Sanitization}: Nested reply indicators (\texttt{>} prefix lines), legal footers, and MIME headers are stripped before storage, reducing noise in the LLM context window.
+    \item \textbf{Synthetic Fallback}: If fewer than \texttt{TARGET\_THREAD\_COUNT} real threads are found, the script appends synthetic threads — 75 hand-authored emails covering key Enron events — to reach the target.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Structured Extraction (\texttt{02\_extract.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\texttt{02\_extract.py} is the most computationally intensive stage. For each thread it dispatches an LLM call and validates the response, with deterministic fallback.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{System Prompt Engineering}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The LLM is given a two-part payload: a \texttt{SYSTEM\_PROMPT} (constant, MD5-hashed as \texttt{PROMPT\_HASH} for versioning) and a \texttt{THREAD\_PROMPT} assembled per thread. The system prompt instructs the model to:
+
+\begin{itemize}
+    \item Return \textbf{only} a valid JSON object — no markdown fences, no commentary.
+    \item Use \textbf{only} the 8 entity types and 25 relation types defined in the ontology.
+    \item Anchor every claim with an \texttt{email\_id} and a verbatim \texttt{quote} ($\leq$\,200\,chars).
+    \item Calibrate confidence: \texttt{1.0} = explicitly stated, \texttt{0.7} = strongly implied, \texttt{0.5} = loosely implied.
+    \item Track \textit{temporal evolution} across the thread — if a fact changes between emails, emit separate claims.
+\end{itemize}
+
+\begin{lstlisting}[caption=Thread prompt template (02\_extract.py)]
+THREAD_PROMPT_TEMPLATE = """Extract entities and claims from this email thread:
+
+Thread Subject: {subject}
+Thread ID: {thread_id}
+Message Count: {message_count}
+Participants: {participants}
+
+--- EMAILS IN CHRONOLOGICAL ORDER ---
+{emails_text}
+--- END OF THREAD ---
+"""
+\end{lstlisting}
+
+Each email in the thread is formatted with its \texttt{email\_id}, sender, recipient, timestamp, subject, and body (truncated to 1000 characters to respect the context window).
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Pydantic Validation Loop}
+% ─────────────────────────────────────────────────────────────────────────────
+
+After receiving the raw LLM string, the parser applies a three-attempt validation loop with progressive JSON repair:
+
+\begin{enumerate}[label=\textbf{Attempt \arabic*:}]
+    \item Direct \texttt{json.loads()} of the raw response.
+    \item Regex extraction of the outermost \texttt{\{...\}} block (handles preamble/postamble hallucinations).
+    \item Truncation to the last valid \texttt{\}} character (handles truncated responses from slow inference).
+\end{enumerate}
+
+After successful parse, each entity and claim is constructed as a validated Pydantic object. Evidence \texttt{char\_offset\_start}/\texttt{end} are computed by searching the original email body for the LLM-returned \texttt{quote} using Python's \texttt{str.find()}, providing exact byte pointers. Claims below \texttt{CONFIDENCE\_THRESHOLD} (0.5) are silently dropped.
+
+The result is an \texttt{ExtractionResult} object stored per-thread, all serialized to \texttt{output/extractions.json}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Deterministic Rule-Based Fallback}
+% ─────────────────────────────────────────────────────────────────────────────
+
+When the LLM is offline (\texttt{DISABLE\_OLLAMA} env var) or all retries fail, a \textbf{deterministic regex extractor} runs on the raw email bodies. It targets:
+
+\begin{itemize}
+    \item \textbf{Monetary values}: \texttt{\$[0-9,]+(\.[0-9]+)?[MBK]?} — creates a \texttt{has\_value} claim with the matched amount as object.
+    \item \textbf{Known entity names}: a hardcoded dictionary of Enron executives, SPEs, and regulators.
+    \item \textbf{Organizational patterns}: regex for \textit{``X reports to Y''}, \textit{``X is the [role] of [org]''}.
+\end{itemize}
+
+This guarantees that every thread produces \textit{some} structured output regardless of model availability, making the full pipeline runnable without a GPU.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Deduplication and Canonicalization (\texttt{03\_dedup.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Naive extraction over 15 overlapping threads produces hundreds of duplicate or near-duplicate entities and claims. \texttt{03\_dedup.py} collapses these into a canonical graph through three sequentially applied layers.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Layer 1 — Artifact Deduplication}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The first layer operates at the extraction-result (per-email) level. Because Enron threads contain heavily quoted previous messages, many emails share near-identical bodies. The algorithm:
+
+\begin{enumerate}
+    \item Extracts the first 150 normalized characters of all evidence excerpts from an \texttt{ExtractionResult}.
+    \item Lowercases and strip-normalizes the content to form a \texttt{norm\_key}.
+    \item If the key has been seen before, the \textit{current} extraction's entities and claims are \textbf{merged into the existing record} rather than discarded — preserving any unique extractions while avoiding LLM re-calls.
+    \item Reports the count of merged duplicates to stdout for monitoring.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Layer 2 — Entity Canonicalization via Union-Find}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Entity canonicalization resolves surface-form variants of the same real-world entity (e.g.\ ``K.\ Lay'', ``Kenneth L.\ Lay'', ``Ken Lay'' $\to$ \textit{Kenneth Lay}).
+
+\textbf{Data structure.} The \texttt{UnionFind} class implements a disjoint-set forest with path compression:
+
+\begin{lstlisting}[caption=UnionFind with path compression (03\_dedup.py)]
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+
+    def find(self, x):
+        if x not in self.parent:
+            self.parent[x] = x
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]  # path compression
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra   # a becomes canonical root
+            return True
+        return False
+\end{lstlisting}
+
+The amortized time complexity for $m$ operations on $n$ entities is $O(m \cdot \alpha(n))$, where $\alpha$ is the inverse Ackermann function — effectively $O(1)$ per operation at any realistic scale.
+
+\textbf{Two-pass merge strategy.} Within each \texttt{EntityType} group:
+
+\begin{enumerate}
+    \item \textbf{Exact match}: Entities sharing the same \texttt{canonical\_key()} (lowercased name + type) are immediately unioned.
+    \item \textbf{Semantic similarity}: For all unmerged pairs, names (plus alias lists) are encoded using \texttt{SentenceTransformer("all-MiniLM-L6-v2")} into 384-dimensional vectors. Pairs with cosine similarity $\geq 0.85$ are unioned.
+\end{enumerate}
+
+$$\text{cosine\_sim}(\mathbf{a}, \mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{a}\| \cdot \|\mathbf{b}\| + \epsilon}$$
+
+After all unions are established, canonical representatives are selected (lowest UUID, or the entity with the most evidence). All \texttt{subject\_id} and \texttt{object\_id} references in claims are rewritten to point to the canonical ID. Aliases are accumulated in the winner's \texttt{aliases} list. Every merge emits a \texttt{MergeRecord} with \texttt{reason="exact\_match"} or \texttt{reason=f"semantic\_similarity=\{score:.2f\}"}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Layer 3 — Claim Deduplication and Temporal Super-session}
+% ─────────────────────────────────────────────────────────────────────────────
+
+After entity canonicalization, many claims become identical when their \texttt{canonical\_key()} is re-evaluated (since \texttt{subject\_name} and \texttt{object\_name} now point to canonical forms). The algorithm:
+
+\begin{enumerate}
+    \item Groups claims by their \texttt{canonical\_key()} = \texttt{subject|relation|object}.
+    \item Within each group, identifies the claim with the most recent \texttt{valid\_from} as the \textit{winner}.
+    \item Evidence lists from all duplicates are merged into the winner (deduped by \texttt{Evidence.fingerprint()}).
+    \item Older duplicate claims are set to \texttt{status = HISTORICAL} with \texttt{superseded\_by = winner.id}.
+    \item A \texttt{MergeRecord} of type \texttt{"claim"} is emitted for each collapse.
+\end{enumerate}
+
+This mechanism naturally handles role transitions: when Jeff Skilling moves from \texttt{has\_role: President} to \texttt{has\_role: CEO}, both claims share the same subject/object pattern but different relations — they are kept as separate claims. But if two threads both extract ``Jeff Skilling has\_role President'' with different timestamps, only the most recent survives as \texttt{CURRENT}; the older becomes \texttt{HISTORICAL}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Memory Graph Construction (\texttt{04\_graph.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\texttt{04\_graph.py} translates the canonicalized \texttt{MemoryStore} into a NetworkX \texttt{MultiDiGraph} and computes summary statistics.
+
+\textbf{Graph structure:}
+\begin{itemize}
+    \item \textbf{Nodes} = canonical \texttt{Entity} objects. Node attributes: \texttt{name}, \texttt{type}, \texttt{aliases}, \texttt{first\_seen}, \texttt{last\_seen}, \texttt{metadata}.
+    \item \textbf{Edges} = \texttt{Claim} objects. A \texttt{MultiDiGraph} is used (not a simple \texttt{DiGraph}) because two entities can have multiple relations of different types simultaneously. Edge key = \texttt{claim.id}. Edge attributes include the full serialized evidence list.
+\end{itemize}
+
+\begin{lstlisting}[caption=Graph construction core (04\_graph.py)]
+G = nx.MultiDiGraph()
+for ent in entities:
+    G.add_node(ent.id, name=ent.name, type=ent.type.value,
+               aliases=ent.aliases, ...)
+for claim in claims:
+    G.add_edge(claim.subject_id, claim.object_id,
+               key=claim.id,
+               relation=claim.relation.value,
+               confidence=claim.confidence,
+               status=claim.status.value,
+               evidence=[e.model_dump() for e in claim.evidence],
+               ...)
+\end{lstlisting}
+
+\textbf{Graph statistics} computed by \texttt{graph\_stats()} and saved to \texttt{output/graph\_stats.json}:
+
+\begin{itemize}
+    \item Node / edge counts, node type distribution, relation type distribution.
+    \item Claim status distribution (\texttt{current} vs.\ \texttt{historical}).
+    \item \textbf{Top 15 entities by degree} — the most connected individuals/organisations.
+    \item \textbf{Evidence coverage}: percentage of claims that have at least one evidence pointer.
+    \item Number of weakly connected components (reveals isolated sub-graphs from sparse threads).
+\end{itemize}
+
+Two serializations are written:
+\begin{itemize}
+    \item \texttt{output/memory\_graph.json}: the full \texttt{MemoryGraphSnapshot} (entities + claims + merge log).
+    \item \texttt{output/memory\_graph\_nx.json}: the NetworkX graph serialized via \texttt{nx.node\_link\_data()} for optional downstream graph-algorithm use.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Semantic Retrieval (\texttt{05\_retrieve.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The retrieval module converts a natural-language question into a grounded \textbf{Context Pack} — a ranked list of claims with evidence snippets that is passed to the LLM for answer generation.
+
+\textbf{Retrieval pipeline (5 stages):}
+
+\begin{enumerate}[label=\textbf{Stage \arabic*:}]
+    \item \textbf{Query Embedding}: The question is encoded by \texttt{all-MiniLM-L6-v2} into a 384-d vector $\mathbf{q}$.
+    \item \textbf{Entity Scoring}: Each entity's name and alias list is concatenated and encoded. Cosine similarity between $\mathbf{q}$ and each entity vector selects the \texttt{top\_k} (default: 10) seed entities.
+    \item \textbf{1-Hop Graph Expansion}: For each seed entity, all incident edges (both in and out) are collected. Then all neighbors of seed entities are added, and their edges are collected. This \textit{1-hop expansion} brings in context that the question didn't explicitly name.
+    \item \textbf{Claim Ranking}: Each candidate claim is encoded (\texttt{subject relation object} as text). A composite score is computed:
+    $$\text{score} = 0.6 \cdot \text{sim}(\mathbf{q}, \mathbf{c}) + 0.2 \cdot \text{confidence} + 0.2 \cdot \text{status\_boost}$$
+    where \texttt{status\_boost} = 1.0 for \texttt{CURRENT} claims and 0.7 for \texttt{HISTORICAL}/\texttt{DISPUTED}.
+    \item \textbf{Evidence Assembly}: Evidence snippets are de-duplicated by fingerprint and sorted by claim score. Each snippet includes \texttt{source\_id}, \texttt{excerpt}, \texttt{timestamp}, \texttt{author}, \texttt{subject}, and the human-readable \texttt{supporting\_claim} string.
+\end{enumerate}
+
+The output \textbf{Context Pack} is a structured dict with \texttt{matched\_entities}, \texttt{relevant\_claims}, \texttt{evidence\_snippets}, and a \texttt{context\_summary} string. This pack is saved to \texttt{output/context\_packs.json} and also passed directly to Ollama to generate a cited answer.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Interactive Application (\texttt{06\_app.py})}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The Streamlit application provides five navigation pages via \texttt{st.sidebar.radio}:
+
+\begin{enumerate}
+    \item \textbf{Graph}: Full interactive knowledge graph rendered via \texttt{vis-network.js} 9.1.2 (bundled locally in \texttt{lib/vis-9.1.2/}).
+    \item \textbf{Entities}: Searchable, filterable table of all canonical entities.
+    \item \textbf{Claims}: Filterable claims table with confidence sliders and status filter.
+    \item \textbf{Query}: Natural-language QA with grounded citations.
+    \item \textbf{Merges}: Audit trail of all \texttt{MergeRecord}s with expand-to-snapshot buttons.
+\end{enumerate}
+
+\textbf{Graph physics configuration.} Disconnected nodes in large graphs tend to drift indefinitely. The embedded JS options use the \texttt{barnesHut} solver with tuned parameters to prevent this:
+
+\begin{lstlisting}[language={},caption=vis-network.js physics config (06\_app.py)]
+physics: {
+    barnesHut: {
+        gravitationalConstant: -8000,
+        centralGravity: 0.8,
+        springLength: 120,
+        damping: 0.3
+    }
+}
+// Freeze layout after stabilization
+network.on("stabilized", function() {
+    network.setOptions({physics: false});
+});
+\end{lstlisting}
+
+The \texttt{stabilized} event listener disables physics after the initial layout converges — preventing indefinite drift while still allowing manual drag-and-drop repositioning.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Exhaustive Setup and Execution Guide}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Prerequisites}
+
+\begin{itemize}
+    \item \textbf{OS}: Linux (tested), macOS, or Windows with WSL2.
+    \item \textbf{Python}: 3.10 or higher (3.11 recommended).
+    \item \textbf{RAM}: 8\,GB minimum; 16\,GB recommended for embedding large graphs.
+    \item \textbf{Disk}: 3\,GB for \texttt{llama3.2:3b} model weights + \textasciitilde{}1\,GB for the Enron archive.
+    \item \textbf{GPU} (optional but recommended): Any CUDA 11.8+ or Apple Silicon GPU significantly accelerates extraction.
+\end{itemize}
+
+\subsection{Step 1 — Install Ollama}
+
+\begin{lstlisting}[style=bashstyle]
+# Official one-line installer (Linux / macOS)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Start the local LLM server (keep this terminal open, or run as a service)
+ollama serve
+
+# Pull the extraction model (approx 2 GB download)
+ollama pull llama3.2:3b
+
+# Verify the model is available
+ollama list
+\end{lstlisting}
+
+\textit{Tip}: To run Ollama as a persistent systemd service on Linux:
+\begin{lstlisting}[style=bashstyle]
+sudo systemctl enable ollama
+sudo systemctl start ollama
+\end{lstlisting}
+
+\subsection{Step 2 — Clone Repository and Set Up Python Environment}
+
+\begin{lstlisting}[style=bashstyle]
+git clone <repository-url>
+cd layer10_new
+
+# Create an isolated virtual environment
+python3 -m venv .venv
+source .venv/bin/activate   # Windows WSL: same command
+
+# Upgrade pip and install all dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+\end{lstlisting}
+
+The \texttt{requirements.txt} pins:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Package} & \textbf{Minimum Version} \\ \midrule
+\texttt{ollama}                & 0.4.0 \\
+\texttt{pydantic}              & 2.0   \\
+\texttt{sentence-transformers} & 2.2.0 \\
+\texttt{networkx}              & 3.0   \\
+\texttt{pyvis}                 & 0.3.2 \\
+\texttt{streamlit}             & 1.30.0 \\
+\texttt{numpy}                 & 1.24.0 \\
+\bottomrule
+\end{tabular}
+\caption{Python dependencies}
+\end{table}
+
+\subsection{Step 3 — (Optional) Place the Enron Archive}
+
+\begin{lstlisting}[style=bashstyle]
+# Download the CMU Maildir archive (~423 MB)
+# From: https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz
+wget https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz -P data/
+tar -xzf data/enron_mail_20150507.tar.gz -C data/
+# Result: data/maildir/<username>/ directories
+\end{lstlisting}
+
+\textit{If this step is skipped}, the pipeline automatically falls back to the 75-email synthetic corpus.
+
+\subsection{Step 4 — Run the Full Pipeline}
+
+\begin{lstlisting}[style=bashstyle]
+# Run all 4 stages sequentially (recommended for first run)
+python run_pipeline.py
+\end{lstlisting}
+
+Or execute each stage independently to inspect intermediate outputs:
+
+\begin{lstlisting}[style=bashstyle]
+# Stage 1: Ingest corpus -> data/enron_raw_emails.json
+python 01_download_corpus.py
+
+# Stage 2: LLM extraction -> output/extractions.json
+# NOTE: This is the slowest step. Without GPU, allow 10-30 min.
+python 02_extract.py
+
+# Stage 3: Deduplicate and canonicalize -> output/deduped.json
+python 03_dedup.py
+
+# Stage 4: Build NetworkX graph -> output/memory_graph.json
+python 04_graph.py
+\end{lstlisting}
+
+\subsection{Step 5 — Launch the Interactive UI}
+
+\begin{lstlisting}[style=bashstyle]
+streamlit run 06_app.py
+\end{lstlisting}
+
+Open \url{http://localhost:8501} in a Chromium-based browser. Firefox is supported but Chromium provides superior Canvas rendering performance for the \texttt{vis-network.js} graph.
+
+\subsection{Step 6 — Run a Semantic Query (CLI)}
+
+\begin{lstlisting}[style=bashstyle]
+# Direct CLI query (no UI required)
+python 05_retrieve.py "Who did Jeff Skilling report to?"
+\end{lstlisting}
+
+The script prints the context pack and, if Ollama is running, a grounded LLM answer with inline citations.
+
+\subsection{Troubleshooting}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Symptom} & \textbf{Cause} & \textbf{Fix} \\ \midrule
+\texttt{ConnectionRefusedError} on port 11434 & Ollama not running & \texttt{ollama serve} \\
+\texttt{model not found} & Model not pulled & \texttt{ollama pull llama3.2:3b} \\
+Extraction produces empty graph & All retries failed, fallback ran & Check \texttt{output/extractions.json} \\
+\texttt{CUDA out of memory} & Model too large for VRAM & Use \texttt{ollama pull llama3.2:1b} \\
+Graph node drift in UI & Physics not stabilized & Reload page; check JS console \\
+\bottomrule
+\end{tabular}
+\caption{Common issues and resolutions}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Output Artifacts}
+% ─────────────────────────────────────────────────────────────────────────────
+
+After a successful pipeline run, the \texttt{output/} directory contains:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{File} & \textbf{Contents} \\ \midrule
+\texttt{extractions.json} & Per-thread \texttt{ExtractionResult} list (raw, pre-dedup). \\
+\texttt{deduped.json} & Canonicalized \texttt{MemoryGraphSnapshot} with merge log. \\
+\texttt{memory\_graph.json} & Final graph snapshot (entities + claims + merges). \\
+\texttt{memory\_graph\_nx.json} & NetworkX node-link JSON for external graph tools. \\
+\texttt{graph\_stats.json} & Summary statistics (node counts, top entities, coverage). \\
+\texttt{context\_packs.json} & Saved context packs from previous retrieval queries. \\
+\bottomrule
+\end{tabular}
+\caption{Pipeline output artifacts}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The Layer10 system demonstrates that a rigorous \textit{grounded} approach to long-term memory — enforcing verbatim evidence anchoring, typed schemas, reversible merges, and temporal claim super-session — produces knowledge graphs that are fundamentally more trustworthy than retrieval systems that operate over raw vector embeddings alone.
+
+Key technical contributions:
+\begin{itemize}
+    \item A \textbf{fully local} extraction pipeline using Ollama, providing privacy guarantees absent from cloud API approaches.
+    \item \textbf{Character-offset evidence pointers} that enable byte-exact source attribution for every claim.
+    \item A \textbf{Union-Find canonicalization} layer backed by sentence-embedding similarity, resolving surface-form variants at sub-linear amortized cost.
+    \item A \textbf{temporal claim lifecycle} model (\texttt{CURRENT} $\to$ \texttt{HISTORICAL} $\to$ \texttt{RETRACTED}) that cleanly captures organizational change over time.
+    \item \textbf{Deterministic fallback extraction} ensuring pipeline completeness without GPU access.
+    \item A \textbf{composite retrieval scoring function} that weights semantic similarity, claim confidence, and temporal recency for grounded QA.
+\end{itemize}
+
+Future directions include: multi-corpus ingestion (Slack, Linear, GitHub Issues) via pluggable corpus adapters; FAISS approximate nearest-neighbor indexing for sub-millisecond retrieval over millions of entities; and a web-hook based live-ingestion mode that incrementally updates the graph as new messages arrive.
+
+\end{document}
 
 % Colors for listings
 \definecolor{codegreen}{rgb}{0,0.6,0}
@@ -57,8 +806,8 @@
     \Large \textit{Grounded Long-Term Memory via Structured Extraction, Deduplication, and a Context Graph} \\[0.2cm]
     \rule{\linewidth}{0.5mm}
 }
-\author{System Architecture \& Implementation Report}
-\date{\today}
+\author{System Architecture \& Implementation Report\\ Divyaansh Narkhede}
+\date{March 2026}
 
 \begin{document}
 
@@ -73,112 +822,181 @@ This report provides a comprehensive technical overview of the Layer10 Grounded 
 
 \section{Introduction}
 
-The primary goal of this project architectures a ``long-term memory'' module capable of parsing vast streams of interpersonal communication and retaining factual, verifiable structures. The Enron Email dataset is selected due to its inherently noisy, stateful, and conflicting communication patterns over real-world organizational changes.
+The primary goal of this project is to architect a ``long-term memory'' module capable of parsing vast streams of interpersonal communication and retaining factual, verifiable structures. The Enron Email dataset is selected due to its inherently noisy, stateful, and conflicting communication patterns over real-world organizational changes. The dataset contains approximately 500,000 emails generated by employees of the Enron Corporation, serving as a highly effective baseline for testing Natural Language Processing (NLP) entity extraction and relationship modeling in a chaotic, real-world corporate environment.
 
-\subsection{Corpus Selection}
-The system models incoming data through chronological thread boundaries constraints (5 to 15 emails per thread limit). The data layer supports:
+\subsection{The Enron Email Dataset}
+The Enron corpus is a universally recognized benchmark in NLP and network analysis, originally made public by the Federal Energy Regulatory Commission (FERC) during its rigorous investigation into Enron's massive 2001 bankruptcy. It encompasses over 600,000 distinct messages generated by roughly 158 senior executives and employees spanning multiple years. 
+
+For the purposes of the Layer10 grounded memory system, the Enron dataset provides the exact complexities required to robustly test long-term extraction structures:
 \begin{itemize}
-    \item \textbf{CMU Maildir Extract}: Parses raw `.txt`/`.eml` structures, handling \textit{In-Reply-To} headers to build deep temporal threads.
-    \item \textbf{Synthetic Base}: A hardcoded 75-email fallback ensuring reliable execution when large archives aren't present.
+    \item \textbf{High-Fidelity Organizational Dynamics}: The dataset naturally models a shifting corporate hierarchy. Individuals are promoted (e.g., Jeff Skilling transitioning to CEO), change reporting structures, and move between departments dynamically over time. This tests the graph's ability to supersede older claims (\texttt{has\_status} transitioning to \texttt{HISTORICAL}).
+    \item \textbf{Complex Domain Entities}: The text contains abundant references to real-world projects, proprietary financial instruments, and special purpose vehicles (e.g., \textit{Chewco, LJM, Raptor}), which act as ideal, non-standard extraction targets for custom ontologies.
+    \item \textbf{Real-World Conversational Noise}: Messages feature unstructured noise, including spelling errors, informal vernacular, varied formatting, and deeply nested reply/forward chains (`>`). This represents a realistic stress-test for the parsing heuristics, artifact deprecation pipeline, and LLM hallucination safeguards.
+\end{itemize}
+
+\subsection{Corpus Selection and Preprocessing}
+The system models incoming data through strict chronological thread boundaries constraints (e.g., 5 to 15 emails per thread limit) to prevent context window overflow in the LLM. The data layer supports:
+\begin{itemize}
+    \item \textbf{CMU Maildir Extract}: Parses raw `.txt`/`.eml` structures, handling \textit{In-Reply-To}, \textit{References}, and \textit{Message-ID} headers to reconstruct deep temporal thread trees before sequential processing.
+    \item \textbf{Synthetic Base}: A hardcoded 75-email fallback ensuring reliable execution and deterministic testing when the complete Enron archives are not actively staged.
 \end{itemize}
 
 \section{Ontology and Schema Design}
 
-To extract predictable intelligence from chaotic emails, the graph mandates strict schemas modeled in \texttt{Pydantic}. The representation avoids loosely-typed schema definitions to guarantee safe ingestion and merging.
+To extract predictable intelligence from chaotic emails, the graph mandates strict schemas modeled in \texttt{Pydantic}. This strict typing ensures downstream processes (like deduplication and graph building) do not crash due to malformed LLM outputs.
 
 \subsection{Entity Types}
-Entities are the main nodes of the graph. The ontology is constrained to 8 distinct tags:
+Entities are the primary nodes of the knowledge graph. The ontology is constrained to 8 distinct tags to prevent schema drift:
 \begin{itemize}
     \item \textbf{Person}: Standard personnel identifiers (e.g., \textit{Kenneth Lay, Jeff Skilling}).
-    \item \textbf{Organisation}: Firms, regulators, market actors (e.g., \textit{Enron, Arthur Andersen}).
-    \item \textbf{FinancialInstrument}: Distinct fiscal mechanisms (e.g., \textit{Raptor, Chewco}).
-    \item \textbf{Event}: Time-bound major occurrences (e.g., \textit{Bankruptcy filing}).
+    \item \textbf{Organisation}: Firms, regulators, market actors (e.g., \textit{Enron, Arthur Andersen, FERC}).
+    \item \textbf{FinancialInstrument}: Distinct fiscal mechanisms and special purpose entities (e.g., \textit{Raptor, Chewco, LJM}).
+    \item \textbf{Event}: Time-bound major occurrences (e.g., \textit{Bankruptcy filing, Board Meeting}).
     \item \textbf{Project}, \textbf{System}, \textbf{Role}, \textbf{Location}.
 \end{itemize}
 
-\subsection{Claim/Relation Modalities}
-All semantic edges connecting Entities are termed \textbf{Claims} and fall under explicit categorizations:
+\subsection{Claim and Relation Modalities}
+All semantic edges connecting Entities are termed \textbf{Claims}. Unlike standard RDF triples, claims in Layer10 are hyper-edges capable of storing vast metadata:
 \begin{enumerate}
     \item \textit{Organisational}: \texttt{works\_at, has\_role, reports\_to}.
     \item \textit{Action-based}: \texttt{sent\_email, decided, warned\_about}.
     \item \textit{Temporal-factual}: \texttt{has\_status, supersedes, related\_to}.
 \end{enumerate}
 
-Every constructed claim retains an absolute validity window governed via \texttt{ClaimStatus} (\textit{current, historical, retracted, disputed}).
+Every constructed claim retains an absolute validity window governed via \texttt{ClaimStatus} (\textit{current, historical, retracted, disputed}). This allows the system to model things like a person changing roles (e.g., from COO to CEO) without erasing the historical fact.
 
 \section{Structured Extraction Engine}
 
-Extraction runs incrementally across email threads, checkpointing completions locally.
+Extraction runs incrementally across email threads, saving intermediate states to JSON to allow resuming on failure. 
 
 \subsection{Dual Extraction Strategy}
-The pipeline uses a synthesized two-pass technique:
+The pipeline uses a synthesized two-pass technique for maximum recall and precision:
 \begin{enumerate}
-    \item \textbf{LLM Extraction}: The primary pass calls a local LLM (\texttt{llama3.2:3b} using Ollama) forced via system prompt to yield strict JSON payloads matching Pydantic requirements. Parsing utilizes multiple attempts up to \texttt{MAX\_RETRIES}.
-    \item \textbf{Regex/Rule Fallback}: A deterministic regular expression engine scans for known static dimensions (dollar values, project names, organizational hierarchies) filling gaps invisible to the LLM or standing in for an offline model.
+    \item \textbf{Generative LLM Extraction}: The primary pass calls a local LLM (\texttt{llama3.2:3b} using Ollama). The LLM is forced via few-shot system prompts and strict JSON-mode decoding to yield payloads matching the exact Pydantic graph schemas. Parsing utilizes exponential backoff and multiple attempts (up to \texttt{MAX\_RETRIES}) to correct structural hallucinations.
+    \item \textbf{Deterministic Rule Fallback}: A deterministic regular expression engine scans for known static dimensions (dollar values, structured project names, standard organizational hierarchies) filling gaps invisible to the LLM or standing in when the generative model fails.
 \end{enumerate}
 
-\subsection{Evidence Grounding and Offsets}
-Unlike standard generation, every entity edge requires justification. This system calculates extreme fidelity constraints:
+\subsection{Evidence Grounding and Pointer Offsets}
+Unlike standard RAG RAG (Retrieval-Augmented Generation) setups, every entity and edge requires rigorous textual justification. This system calculates extreme fidelity constraints:
 \begin{itemize}
-    \item \textbf{Source UUID}: Identifies exact document MD5 hashes.
-    \item \textbf{Verbatim Quoting}: Limited to 300 character excerpts.
-    \item \textbf{Pointer Offsets}: Retains exact \texttt{char\_offset\_start} and \texttt{char\_offset\_end} positions mapping directly back to original byte sequences, ensuring traceability and highlight capability natively in the UI.
+    \item \textbf{Source UUID}: Identifies exact document MD5 hashes and timestamp lineages.
+    \item \textbf{Verbatim Quoting}: Limited to maximum 300-character excerpts to prevent storing entire emails in the node metadata.
+    \item \textbf{Pointer Offsets}: Post-generation validation cross-references the LLM's returned quote against the original text buffer. It retains exact \texttt{char\_offset\_start} and \texttt{char\_offset\_end} indices, mapping directly back to the original byte sequences. This ensures 100\% traceability and enables native text highlighting in the Streamlit UI.
 \end{itemize}
 
 \section{Graph Deduplication and Normalization}
 
-The pipeline consolidates duplicated information using a 3-layered consolidation framework. Crucially, all modifications to the network emit a \texttt{MergeRecord} permitting 100\% reversible snapshots.
+Naive extraction generates isolated, duplicated sub-graphs for every email. The pipeline consolidates this using a rigorous 3-layered consolidation framework. Crucially, all modifications to the network emit a \texttt{MergeRecord} permitting 100\% reversible snapshots.
 
 \subsection{Layer 1: Artifact Deprecation}
-Due to the forwarding nature of email threads, sub-strings are highly repetitive. Artifact Dedup checks content-hashing inside overlapping timestamps to eliminate duplicate LLM calls on identical text blocks.
+Due to the forwarding nature of email threads, message bodies are highly repetitive. Artifact Dedup checks content-hashing (SHA-256) inside chronologically overlapping contexts to eliminate duplicate LLM inference calls on identical quoted text blocks.
 
 \subsection{Layer 2: Entity Canonicalization (Union-Find)}
-Implemented across \texttt{03\_dedup.py}:
+Implemented across \texttt{03\_dedup.py}, this step merges similar individuals (e.g., "K. Lay" and "Kenneth Lay"):
 \begin{itemize}
-    \item \textbf{Deterministic Matching}: Directly lower-cases properties and string definitions.
-    \item \textbf{Semantic Similarity Embedding}: Within each domain-type, pairs embed using \texttt{all-MiniLM-L6-v2}. Computations generating Cosine Similarity above the 0.85 threshold enact merges.
-    \item \textbf{Disjoint-set structure}: Entities inherit subsets using an amortized $O(\alpha(N))$ graph technique.
+    \item \textbf{Deterministic Matching}: Directly lower-cases properties and strips punctuation for baseline heuristic string matching.
+    \item \textbf{Semantic Similarity Embedding}: Within each domain-type, pairs embed using \texttt{all-MiniLM-L6-v2} (via SentenceTransformers). Computations generating Cosine Similarity above a strict 0.85 threshold enact merges.
+    \item \textbf{Disjoint-set structure}: Entities inherit subsets using an amortized $O(\alpha(N))$ Disjoint Set (Union-Find) graph technique. This allows tracking the "Canonical" parent ID while preserving the original variant names in an alias pool.
 \end{itemize}
 
 \subsection{Layer 3: Resolution and Super-session}
-Redundant facts (Claims) are collapsed temporally via specific keys (`subj|rel|obj`). For conflicting statuses (e.g., transitioning from CFO to CEO), older claims deprecate into \texttt{HISTORICAL} statuses with valid super-session pointer references linking to the current active Claim.
+Redundant facts (Claims) are collapsed temporally via specific signature keys (`subj|rel|obj`). For conflicting statuses, the algorithm checks the temporal bounds. Older claims automatically deprecate into \texttt{HISTORICAL} statuses, retaining pointer references linking them to the currently active claim.
 
 \section{System Architecture Components}
 
-The core architecture operates over interconnected procedural Python layers.
+The core architecture operates over interconnected, stateless Python procedural layers. Each script passes data strictly through JSON payloads mapped on disk in the \texttt{output/} directory.
 
 \begin{table}[H]
 \centering
 \begin{tabular}{@{}ll@{}}
 \toprule
 \textbf{File / Module} & \textbf{Architectural Responsibility} \\ \midrule
-\texttt{schema.py} & Core Pydantic types, MemoryStore class wrappers. \\
-\texttt{config.py} & Constant limits, path ingestion, threshold bounds. \\
-\texttt{01\_download\_corpus.py} & Ingests external archives, parses to sequential threading. \\
-\texttt{02\_extract.py} & Dispatches generative model extraction and checks offset logic. \\
-\texttt{03\_dedup.py} & Consolidates representations, logs historical \texttt{undo\_merge} events. \\
-\texttt{04\_graph.py} & Serializes optimized states to NetworkX DiGraph storage. \\
-\texttt{06\_app.py} & Bootstraps local web UI (Streamlit \& vis-network). \\
+\texttt{schema.py} & Core Pydantic types, MemoryStore classes, and validation logic. \\
+\texttt{config.py} & Constant limits, threshold bounds, and OS path configurations. \\
+\texttt{01\_download\_corpus.py} & Ingests external archives, parsing into strict sequential threads. \\
+\texttt{02\_extract.py} & Dispatches generative LLM inference and validates offset bounding. \\
+\texttt{03\_dedup.py} & Union-Find consolidation, producing \texttt{deduped.json} \& merge logs. \\
+\texttt{04\_graph.py} & Translates consolidated data into a robust NetworkX DiGraph. \\
+\texttt{05\_retrieve.py} & RAG retrieval scripts, 1-hop traversal via SentenceTransformers. \\
+\texttt{06\_app.py} & Bootstraps local web UI (Streamlit \& customized \texttt{vis-network.js}). \\
 \bottomrule
 \end{tabular}
-\caption{System Mapping}
+\caption{System Architecture Mapping}
 \end{table}
 
 \section{Retrieval and Interface Visualization}
 
 \subsection{Semantic Retrieval Pipeline}
-User promptings are converted into embeddings utilizing SentenceTransformers. Vector comparison isolates related Entity nodes, sequentially executing a 1-hop MultiDiGraph crawl to fetch all correlated Claims. Resulting records are fed alongside original quotes into a context-packing schema dictating explicit factual origins.
+User prompt vectors are generated utilizing SentenceTransformers. A brute-force / FAISS vector comparison isolates the most semantically related Entity nodes. The pipeline then sequentially executes a 1-hop MultiDiGraph crawl out from those entry points to fetch all correlated Claims. Resulting records are fed alongside original textual quotes into a Context-Packing framework dictating explicit factual origins to the final answer-generation LLM.
 
 \subsection{Streamlit Interactive Platform}
-The visual interface guarantees immediate interactions without heavy frontend stacks:
+The visual interface provides real-time exploration without requiring a heavy React/Node.js frontend stack:
 \begin{itemize}
-    \item \textbf{Graph Module}: Employs tuned physics logic \texttt{vis-network.js}, utilizing gravitational constant metrics to prohibit node drift while visualizing isolated entity pockets.
-    \item \textbf{Semantic Queries}: Facilitates synthesized text completion powered directly out of constructed Context Packs yielding explicit citations.
-    \item \textbf{Audit Modules}: A `Merges` tab detailing origin snapshots for safe reversal processes ensuring long-term maintenance tracking.
+    \item \textbf{Graph Module}: Employs a highly tuned physics engine embedded inside \texttt{vis-network.js}. It utilizes `barnesHut` gravitational constants (central gravity of 0.8, high damping) to prohibit node drift while visualizing isolated entity pockets, stabilizing automatically using a custom JS event listener.
+    \item \textbf{Semantic Queries}: Facilitates multi-hop QA powered directly out of constructed Context Packs yielding explicit citations and source strings.
+    \item \textbf{Audit Modules}: Contains a `Merges` tab detailing origin snapshots for safe reversal processes, ensuring long-term maintenance tracking and explainability.
 \end{itemize}
+
+\section{Exhaustive Execution Instructions}
+
+To deploy and execute the Layer10 pipeline locally, follow the comprehensive steps below. This guide assumes a Linux/macOS environment natively or via WSL2. 
+
+\subsection{1. Install Ollama and Local LLM Backend}
+The pipeline requires a local LLM server to process unstructured text securely and rapidly via an exposed REST API.
+\begin{enumerate}
+    \item Install Ollama using the official curl script:
+    \begin{lstlisting}[language=bash]
+curl -fsSL https://ollama.com/install.sh | sh
+    \end{lstlisting}
+    \item Start the Ollama server (this can be run in a separate persistent terminal, tmux session, or systemd service):
+    \begin{lstlisting}[language=bash]
+ollama serve
+    \end{lstlisting}
+    \item Pull the required generative model. \texttt{llama3.2:3b} is highly recommended for an optimal balance of speed and JSON-following capabilities:
+    \begin{lstlisting}[language=bash]
+ollama run llama3.2:3b
+    \end{lstlisting}
+    \textit{Note: Once the interactive chat prompt opens, you can safely use \texttt{Ctrl+D} to exit. The model weights are now cached.}
+\end{enumerate}
+
+\subsection{2. Workspace and Environment Setup}
+It is mandatory to set up an isolated Python virtual environment to avoid package collision, especially with PyTorch/SentenceTransformers.
+\begin{enumerate}
+    \item Create and activate the virtual environment:
+    \begin{lstlisting}[language=bash]
+python3 -m venv .venv
+source .venv/bin/activate
+    \end{lstlisting}
+    \item Upgrade pip, then install the required dependencies (NetworkX, Streamlit, Pydantic, etc.):
+    \begin{lstlisting}[language=bash]
+pip install --upgrade pip
+pip install -r requirements.txt
+    \end{lstlisting}
+\end{enumerate}
+
+\subsection{3. Pipeline Execution Methodology}
+The system is constructed as a decoupled, state-saving pipeline. You can execute all stages consecutively using the wrapper script, which automatically provisions missing folders (\texttt{output/}, \texttt{data/}):
+\begin{lstlisting}[language=bash]
+python run_pipeline.py
+\end{lstlisting}
+
+Alternatively, developers can execute components step-by-step to inspect payload transformations:
+\begin{itemize}
+    \item \textbf{Ingestion} (\texttt{python 01\_download\_corpus.py}): Downloads/synthesizes target datasets into raw JSON.
+    \item \textbf{Extraction} (\texttt{python 02\_extract.py}): Dispatches batches to Ollama. \textit{Warning: Without hardware acceleration (Apple Silicon / CUDA GPUs), this phase may run slowly. Progress bars will stream to stdout.}
+    \item \textbf{Consolidation} (\texttt{python 03\_dedup.py}): Runs vector-embedded similarity checks and executes the Union-Find deduplication.
+    \item \textbf{Serialization} (\texttt{python 04\_graph.py}): Translates normalized objects into NetworkX graph structures (\texttt{memory\_graph.json} and \texttt{memory\_graph\_nx.json}).
+\end{itemize}
+
+\subsection{4. Launching the Analytical User Interface}
+To interact with the consolidated dataset visually:
+\begin{lstlisting}[language=bash]
+streamlit run 06_app.py
+\end{lstlisting}
+Streamlit will bind to port 8501. Open \url{http://localhost:8501} in a Chromium-based browser (recommended for optimal \texttt{vis-network} WebGL/Canvas rendering performance) to query the intelligence graph.
 
 \section{Conclusion}
 
-The resulting Layer10 Graph memory mechanism ensures an uncompromising traceability contract bridging raw organizational activity streams with dense generative insights. Future expansion into broader modalities like Slack/Linear channels involves leveraging similar chronological overlap strategies mapping unique channel IDs against domain organizational ontologies while keeping the exact deterministic rollback mechanisms detailed above.
+The resulting Layer10 Grounded Memory mechanism establishes an uncompromising traceability contract, successfully bridging chaotic organizational activity streams with cohesive, highly-structured generative insights. By enforcing rigid schema parsing, dynamic pointer offsetting, and verifiable disjoint-set consolidations, the model counteracts standard LLM hallucinations. Future expansion into broader modalities like Slack or Linear channels is supported by this architecture, which can leverage duplicate mapping techniques against unified domain ontologies while retaining exact deterministic rollback capabilities.
 
 \end{document}

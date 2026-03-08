@@ -1,14 +1,16 @@
 """
-Step 5 – Retrieval and Grounding.
+Given a question, this script finds the most relevant parts of the graph
+and packages them up so the LLM can give a grounded answer.
 
-Given a natural-language question, retrieve a grounded context pack:
-  1. Embed the question
-  2. Find matching entities/claims via semantic search
-  3. Expand via graph traversal (1-hop neighbours)
-  4. Rank by relevance + confidence + recency
-  5. Format citations with evidence
+How it works:
+  1. Embed the question using the same model we used for dedup
+  2. Score every entity by how closely it matches the question
+  3. Walk one hop out from the top matches to catch related context
+  4. Rank the resulting claims by relevance + confidence + freshness
+  5. Pull out the supporting quotes and format everything as citations
 
-Optionally calls Ollama for a grounded final answer.
+If Ollama is running, it will also generate a final answer using
+the context pack as its source of truth.
 """
 import json, os, sys
 from datetime import datetime
@@ -29,7 +31,7 @@ except ImportError:
 import networkx as nx
 import numpy as np
 
-# ─── Lazy-load models ────────────────────────────────────────────────────────
+# ── Only initialize the embedding model when we first need it ───────────────
 _embed_model = None
 
 def get_embed_model():
@@ -45,11 +47,9 @@ def cosine_sim(a, b) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Load graph
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Load the graph from disk into memory ───────────────────────────────────
 def load_graph_simple(path: str = GRAPH_PATH):
-    """Load graph from the JSON snapshot directly."""
+    """Reads the graph JSON from disk and rebuilds entities, claims, and the NetworkX graph."""
     with open(path) as f:
         data = json.load(f)
 
@@ -82,9 +82,7 @@ def load_graph_simple(path: str = GRAPH_PATH):
     return G, entities, claims
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Retrieval
-# ═════════════════════════════════════════════════════════════════════════════
+# ── The main retrieval function — turns a question into a context pack ────────
 def retrieve_context(
     question: str,
     G: nx.MultiDiGraph,
@@ -107,10 +105,10 @@ def retrieve_context(
     """
     model = get_embed_model()
 
-    # 1. Embed the question
+    # Step 1: Turn the question into a vector
     q_emb = model.encode([question])[0]
 
-    # 2. Score all entities by semantic similarity
+    # Step 2: Score every entity by how closely its name/aliases match the question
     entity_names = [e.name for e in entities]
     entity_alias_texts = [
         f"{e.name} {' '.join(e.aliases)}" for e in entities
@@ -125,7 +123,7 @@ def retrieve_context(
     entity_scores.sort(key=lambda x: -x[1])
     top_entities = entity_scores[:top_k]
 
-    # 3. Gather claims from matched entities + 1-hop expansion
+    # Step 3: Collect every claim touching our top entities, then walk one hop further
     matched_entity_ids = {ent.id for ent, _ in top_entities}
     relevant_claim_ids = set()
     relevant_claims = []
@@ -150,7 +148,7 @@ def retrieve_context(
                         relevant_claim_ids.add(key)
                         relevant_claims.append(data)
 
-    # 4. Score claims by relevance to question
+    # Step 4: Score each candidate claim against the question
     claim_texts = []
     for c in relevant_claims:
         text = f"{c.get('subject_name', '')} {c.get('relation', '')} {c.get('object_name', '')}"
@@ -172,7 +170,7 @@ def retrieve_context(
     else:
         ranked_claims = []
 
-    # 5. Extract evidence snippets
+    # Step 5: Pull out the supporting quotes, deduplicated by fingerprint
     evidence_snippets = []
     seen_evidence = set()
     for claim_data, score in ranked_claims:
@@ -192,7 +190,7 @@ def retrieve_context(
                 })
                 seen_evidence.add(fp)
 
-    # 6. Build context summary
+    # Step 6: Build a human-readable summary of the top claims for the context pack
     context_lines = []
     for i, (claim_data, score) in enumerate(ranked_claims[:10]):
         status_marker = "✓" if claim_data.get("status") == "current" else "⟲"

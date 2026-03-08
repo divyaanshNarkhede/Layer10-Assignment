@@ -1,16 +1,18 @@
 """
-Step 6 – Streamlit Memory-Graph Explorer.
+This is the main web interface for the Layer10 memory system.
 
-Interactive front-end for the Layer10 grounded memory system.
+It gives you a way to actually explore everything the pipeline built —
+browse the graph, ask questions, dig into the evidence, and see what
+got merged during deduplication.
 
-Pages (sidebar navigation):
-  1. Query        – Semantic search & grounded Q&A (with LLM synthesis)
-  2. Graph        – Interactive vis-network.js visualisation
-  3. Evidence     – Browse all entities, claims & evidence chains
-  4. Merges       – Audit log of entity/claim deduplication (with undo)
-  5. Statistics   – High-level graph metrics
+Here's what each page does:
+  1. Query     – Ask a question and get a grounded answer from the graph
+  2. Graph     – See the knowledge graph rendered as an interactive network
+  3. Evidence  – Browse all entities, claims, and the quotes backing them
+  4. Merges    – See everything that got deduplicated, and why
+  5. Statistics – Quick overview of how big and dense the graph is
 
-Launch:
+To launch:
     streamlit run 06_app.py
 """
 import json, os, sys, html, hashlib
@@ -24,9 +26,7 @@ from config import (
 
 import streamlit as st
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Page config
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Set up the Streamlit page before anything else renders ──────────────────
 st.set_page_config(
     page_title="Layer10 | Memory Graph",
     page_icon="L10",
@@ -34,9 +34,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Custom CSS  (no tab hacks — sidebar radio nav is used instead)
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Inject some custom CSS to make everything look decent ───────────────────
+# (We use sidebar radio buttons for navigation instead of tabs,
+#  so no tab hacks needed here)
 st.markdown("""
 <style>
 /* ─── Sidebar ───────────────────────────────────────────────────── */
@@ -143,9 +143,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Type → colour mapping
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Each entity type and claim status gets its own colour in the UI ─────────
 TYPE_COLOURS = {
     "Person":              "#4CAF50",
     "Organisation":        "#2196F3",
@@ -173,9 +171,7 @@ def status_badge(s: str) -> str:
     return f'<span class="badge" style="background:{c}">{html.escape(s)}</span>'
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Data loading (cached)
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Load data from disk and cache it so we're not re-reading on every click ──
 @st.cache_data(ttl=300)
 def load_graph():
     with open(GRAPH_PATH) as f:
@@ -197,18 +193,16 @@ def load_context_packs():
     return []
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Build vis-network HTML (embedded)
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Build the graph visualization as a self-contained HTML blob ──────────────
 def build_vis_html(entities, claims, height=620, filter_types=None, search_q=""):
-    """Return a self-contained HTML string using vis-network.js."""
+    """Builds a standalone HTML page with the vis-network graph embedded in it."""
 
-    # Read bundled JS/CSS
+    # Pull in the bundled vis-network library (we ship it locally, no CDN needed)
     base = os.path.dirname(os.path.abspath(__file__))
     vis_js  = Path(base, "lib", "vis-9.1.2", "vis-network.min.js").read_text()
     vis_css = Path(base, "lib", "vis-9.1.2", "vis-network.css").read_text()
 
-    # Prepare nodes
+    # Figure out which entities actually appear in claims so we can skip isolated nodes
     ent_map = {e["id"]: e for e in entities}
     nodes_js = []
     search_lower = search_q.lower().strip()
@@ -239,7 +233,7 @@ def build_vis_html(entities, claims, height=620, filter_types=None, search_q="")
             f'shape:"dot",size:12}}'
         )
 
-    # Prepare edges
+    # Now build the edges — each one is a claim between two entities
     edges_js = []
     for c in claims:
         if c.get("status") == "retracted":
@@ -288,14 +282,16 @@ var edges=new vis.DataSet([{",".join(edges_js)}]);
 var container=document.getElementById('g');
 var data={{nodes:nodes,edges:edges}};
 var options={{
-  physics:{{barnesHut:{{gravitationalConstant:-4000,centralGravity:0.25,springLength:120,damping:0.15}},
-           stabilization:{{iterations:120,fit:true}}}},
+  physics:{{barnesHut:{{gravitationalConstant:-6000,centralGravity:0.8,springLength:100,springConstant:0.04,damping:0.3,avoidOverlap:0.2}},
+           stabilization:{{iterations:200,fit:true}},
+           minVelocity:0.75,maxVelocity:30}},
   interaction:{{hover:true,tooltipDelay:100,zoomView:true,dragView:true,
                navigationButtons:false,keyboard:true}},
   edges:{{smooth:{{type:"continuous"}}}},
   layout:{{improvedLayout:true}}
 }};
 var network=new vis.Network(container,data,options);
+network.on("stabilized",function(){{network.setOptions({{physics:false}});}});
 </script></body></html>"""
 
 
@@ -310,9 +306,7 @@ def _js(s: str) -> str:
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Retrieval helpers
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Semantic search helpers — embed the query and compare against the graph ───
 @st.cache_resource
 def get_embed_model():
     from sentence_transformers import SentenceTransformer
@@ -329,7 +323,7 @@ def cosine_sim(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 def search_graph(query: str, graph_data: dict, top_k: int = 15):
-    """Semantic search over entities + claims, return ranked results."""
+    """Embeds the query and ranks every entity and claim by how closely it matches."""
     q_emb = embed_text(query)
     scored = []
 
@@ -348,7 +342,7 @@ def search_graph(query: str, graph_data: dict, top_k: int = 15):
     return scored[:top_k]
 
 def format_grounded_answer(results):
-    """Format search results into a grounded narrative."""
+    """Turns the raw search results into a readable bullet-point summary."""
     lines = []
     for kind, item, score in results[:8]:
         if kind == "entity":
@@ -366,7 +360,7 @@ def format_grounded_answer(results):
     return "\n".join(lines)
 
 
-# ─── Ollama-powered answer synthesis ─────────────────────────────────────────
+# ── Try to import Ollama so we can generate a proper LLM answer if it's running
 _HAS_OLLAMA_UI = False
 try:
     if not os.environ.get("DISABLE_OLLAMA"):
@@ -378,13 +372,13 @@ except ImportError:
 
 def generate_llm_answer(query: str, results: list) -> str | None:
     """
-    Call Ollama to synthesize a grounded answer from search results.
-    Returns the LLM's response string, or None on failure.
+    Sends the top search results to Ollama as context and asks it
+    to write a grounded answer. Returns None if Ollama isn't available.
     """
     if not _HAS_OLLAMA_UI:
         return None
 
-    # Build context from search results
+    # Turn the search results into a plain-text context block for the LLM
     context_lines = []
     for kind, item, score in results[:10]:
         if kind == "entity":
@@ -441,9 +435,7 @@ def generate_llm_answer(query: str, results: list) -> str | None:
         return f"LLM error: {e}"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Sidebar  (navigation + metrics)
-# ═════════════════════════════════════════════════════════════════════════════
+# ── The sidebar holds the navigation radio and a few quick stats ────────────
 PAGES = [
     "Query",
     "Graph",
@@ -454,7 +446,7 @@ PAGES = [
 
 
 def render_sidebar(graph_data) -> str:
-    """Render the sidebar and return the selected page name."""
+    """Draws the sidebar with navigation and graph stats, returns which page was picked."""
     with st.sidebar:
         st.markdown("## Layer10 Memory")
         st.caption("Grounded Long-Term Memory Graph")
@@ -488,9 +480,7 @@ def render_sidebar(graph_data) -> str:
     return page
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Page 1: Query
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Page 1: The main query interface where users ask questions ───────────────
 def page_query(graph_data):
     st.markdown('<div class="page-header"><h2>Semantic Query</h2></div>',
                 unsafe_allow_html=True)
@@ -515,7 +505,7 @@ def page_query(graph_data):
             results = search_graph(query, graph_data, top_k=top_k)
 
         if results:
-            # --- LLM-synthesized answer ---
+            # If Ollama is available, let it write a proper answer using the context
             if use_llm:
                 with st.spinner("Generating grounded answer..."):
                     llm_answer = generate_llm_answer(query, results)
@@ -524,7 +514,7 @@ def page_query(graph_data):
                     st.markdown(f"**AI Answer:**\n\n{llm_answer}")
                     st.markdown("</div>", unsafe_allow_html=True)
             else:
-                # Fallback: template-based answer
+                # Ollama not available — fall back to a formatted bullet-point summary
                 st.markdown('<div class="answer-box">', unsafe_allow_html=True)
                 st.markdown("**Grounded Answer:**\n\n" + format_grounded_answer(results))
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -584,9 +574,7 @@ def page_query(graph_data):
                         )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Page 2: Graph
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Page 2: The interactive knowledge graph ─────────────────────────────────
 def page_graph(graph_data):
     st.markdown('<div class="page-header"><h2>Interactive Memory Graph</h2></div>',
                 unsafe_allow_html=True)
@@ -621,9 +609,7 @@ def page_graph(graph_data):
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Page 3: Evidence
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Page 3: Browse entities and claims with their supporting evidence ────────
 def page_evidence(graph_data):
     st.markdown('<div class="page-header"><h2>Entity & Claim Browser</h2></div>',
                 unsafe_allow_html=True)
@@ -717,9 +703,7 @@ def page_evidence(graph_data):
             )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Page 4: Merges
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Page 4: Audit log — shows everything the deduplicator collapsed and why ──
 def page_merges(graph_data):
     st.markdown('<div class="page-header"><h2>Deduplication Audit Log</h2></div>',
                 unsafe_allow_html=True)
@@ -729,7 +713,7 @@ def page_merges(graph_data):
         st.info("No merge records found.")
         return
 
-    # Undo merge support
+    # Let the user know they can reverse any of these merges programmatically
     st.caption("Reversible merges can be undone using the undo_merge() API "
                "with a MemoryStore instance.")
 
@@ -779,9 +763,7 @@ def page_merges(graph_data):
         )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Page 5: Statistics
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Page 5: High-level stats about the graph ────────────────────────────────
 def page_stats(graph_data):
     st.markdown('<div class="page-header"><h2>Graph Statistics</h2></div>',
                 unsafe_allow_html=True)
@@ -791,7 +773,7 @@ def page_stats(graph_data):
     claims = graph_data.get("claims", [])
     merges = graph_data.get("merge_log", [])
 
-    # Top metrics row
+    # Show the headline numbers at the top
     cols = st.columns(5)
     items = [
         ("Nodes", stats.get("nodes", len(entities))),
@@ -810,7 +792,7 @@ def page_stats(graph_data):
 
     st.divider()
 
-    # Breakdowns
+    # Break down the distribution by type, relation, and status
     c1, c2, c3 = st.columns(3)
 
     with c1:
@@ -852,7 +834,7 @@ def page_stats(graph_data):
                 unsafe_allow_html=True,
             )
 
-    # Top entities by degree
+    # Which entities show up the most across claims?
     st.divider()
     st.markdown("**Top entities by connection count**")
     degree = {}
@@ -872,7 +854,7 @@ def page_stats(graph_data):
             unsafe_allow_html=True,
         )
 
-    # Evidence coverage
+    # How well-evidenced is the graph? Show the coverage numbers
     total_ev = sum(len(c.get("evidence", [])) for c in claims)
     grounded = sum(1 for c in claims if c.get("evidence"))
     st.divider()
@@ -885,11 +867,9 @@ def page_stats(graph_data):
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Main
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Entry point ──────────────────────────────────────────────────────────────
 def main():
-    # Check data exists
+    # Make sure the pipeline has been run before we try to load anything
     if not os.path.exists(GRAPH_PATH):
         st.error(
             f"No graph found at `{GRAPH_PATH}`.\n\n"
@@ -900,7 +880,7 @@ def main():
     graph_data = load_graph()
     page = render_sidebar(graph_data)
 
-    # Route to the selected page
+    # Send the user to whichever page they picked in the sidebar
     if page == "Query":
         page_query(graph_data)
     elif page == "Graph":

@@ -1,11 +1,18 @@
 """
-Ontology / Schema for the Layer10 Memory Graph.
+All the data models for the Layer10 memory system live here.
 
-Defines all Pydantic models for:
-  - Entities  (Person, Organisation, System, Project, FinancialInstrument, Event)
-  - Claims    (typed relations between entities with confidence)
-  - Evidence  (grounded pointers back to source text)
-  - Extraction envelope (versioned wrapper)
+These Pydantic classes are the single source of truth for what an entity,
+a claim, and a piece of evidence actually look like. Every other module
+imports from this file — the extractor, the deduplicator, the graph builder,
+and the UI all work with these same typed objects.
+
+What's in here:
+  - Entity       — a person, org, project, etc.
+  - Claim        — a typed, evidenced relationship between two entities
+  - Evidence     — a verbatim quote with char offsets back to the source email
+  - ExtractionResult — the envelope wrapping one thread's extraction output
+  - MergeRecord  — audit trail entry for every dedup operation
+  - MemoryStore  — the main in-memory container for the whole graph
 """
 from __future__ import annotations
 import uuid, hashlib
@@ -15,7 +22,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-# ─── Entity Types ────────────────────────────────────────────────────────────
+# ── The eight types of things we track in the graph ─────────────────────────
 class EntityType(str, Enum):
     PERSON = "Person"
     ORGANISATION = "Organisation"
@@ -28,7 +35,7 @@ class EntityType(str, Enum):
 
 
 class Entity(BaseModel):
-    """A canonical entity in the memory graph."""
+    """One node in the knowledge graph — a person, org, project, or anything else we track."""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     name: str
     type: EntityType
@@ -38,11 +45,11 @@ class Entity(BaseModel):
     metadata: dict = Field(default_factory=dict)
 
     def canonical_key(self) -> str:
-        """Deterministic key for dedup: lowered name + type."""
+        """Returns a stable key used to detect duplicate entities during dedup."""
         return f"{self.type.value}::{self.name.lower().strip()}"
 
 
-# ─── Relation / Claim Types ─────────────────────────────────────────────────
+# ── Every type of relationship a claim can express ──────────────────────────
 class RelationType(str, Enum):
     # Organisational
     WORKS_AT = "works_at"
@@ -76,9 +83,9 @@ class RelationType(str, Enum):
     ACQUIRED = "acquired"
 
 
-# ─── Evidence ────────────────────────────────────────────────────────────────
+# ── A grounded pointer back to the exact email that supports a claim ─────────
 class Evidence(BaseModel):
-    """A grounded pointer back to a source artifact."""
+    """Ties a claim back to the exact quote in the exact email that supports it."""
     source_id: str                         # email_id
     excerpt: str                           # exact quote (≤ 300 chars)
     timestamp: Optional[str] = None        # event time
@@ -89,12 +96,12 @@ class Evidence(BaseModel):
     char_offset_end: Optional[int] = None    # end char offset in source
 
     def fingerprint(self) -> str:
-        """Content hash for dedup of identical evidence."""
+        """A short hash we use to detect when two evidence objects are actually the same quote."""
         raw = f"{self.source_id}|{self.excerpt[:100]}"
         return hashlib.md5(raw.encode()).hexdigest()
 
 
-# ─── Claim ───────────────────────────────────────────────────────────────────
+# ── A single factual assertion between two entities, grounded in evidence ─────
 class ClaimStatus(str, Enum):
     CURRENT = "current"
     HISTORICAL = "historical"       # superseded by a newer claim
@@ -103,7 +110,7 @@ class ClaimStatus(str, Enum):
 
 
 class Claim(BaseModel):
-    """A single factual assertion linking two entities, grounded in evidence."""
+    """One edge in the knowledge graph — something we believe to be true, with a source to back it up."""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     subject_id: str
     subject_name: str
@@ -125,7 +132,7 @@ class Claim(BaseModel):
         return max(0.0, min(1.0, v))
 
     def canonical_key(self) -> str:
-        """Key for claim dedup (ignores evidence list)."""
+        """Returns a signature for this claim used to find duplicates (ignores evidence and confidence)."""
         return (
             f"{self.subject_name.lower().strip()}|"
             f"{self.relation.value}|"
@@ -133,9 +140,9 @@ class Claim(BaseModel):
         )
 
 
-# ─── Extraction Envelope ────────────────────────────────────────────────────
+# ── The output envelope for one thread's extraction pass ────────────────────
 class ExtractionResult(BaseModel):
-    """Wrapper returned by the extraction step for one source artifact."""
+    """Everything the extractor found in a single email thread — entities, claims, and metadata."""
     source_id: str
     entities: list[Entity] = Field(default_factory=list)
     claims: list[Claim] = Field(default_factory=list)
@@ -148,9 +155,9 @@ class ExtractionResult(BaseModel):
     raw_llm_output: Optional[str] = None   # for debugging
 
 
-# ─── Merge / Dedup Records ──────────────────────────────────────────────────
+# ── Audit trail — one record for every merge the deduplicator performed ──────
 class MergeRecord(BaseModel):
-    """Audit trail for every entity or claim merge."""
+    """Records what got merged, why, and what both sides looked like before the merge."""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     merge_type: str                # "entity" or "claim"
     winner_id: str
@@ -166,9 +173,9 @@ class MergeRecord(BaseModel):
     )
 
 
-# ─── Full Graph Snapshot ─────────────────────────────────────────────────────
+# ── A flat, JSON-serializable snapshot of the whole graph at a point in time ──
 class MemoryGraphSnapshot(BaseModel):
-    """Serialisable snapshot of the entire memory graph."""
+    """A flat list representation of the graph — easy to write to JSON and read back."""
     entities: list[Entity] = Field(default_factory=list)
     claims: list[Claim] = Field(default_factory=list)
     merge_log: list[MergeRecord] = Field(default_factory=list)
@@ -179,11 +186,12 @@ class MemoryGraphSnapshot(BaseModel):
     corpus_info: dict = Field(default_factory=dict)
 
 
-# ─── Memory Store (first-class container) ────────────────────────────────────
+# ── The main in-memory container — indexed access, helpers, and serialization ─
 class MemoryStore(BaseModel):
     """
-    First-class container for the memory graph.
-    Provides indexed access, add/remove helpers, and serialisation.
+    The main working container for the graph during the pipeline.
+    Gives you fast dict-based lookups, helper methods for finding
+    entities and claims, and easy JSON serialization.
     """
     entities: dict[str, Entity] = Field(default_factory=dict)
     claims: dict[str, Claim] = Field(default_factory=dict)
@@ -194,9 +202,9 @@ class MemoryStore(BaseModel):
     )
     corpus_info: dict = Field(default_factory=dict)
 
-    # ── Entity helpers ────────────────────────────────────────────────────
+    # ── Helpers for working with entities ────────────────────────────────
     def add_entity(self, entity: Entity) -> Entity:
-        """Add an entity (or update if same ID exists)."""
+        """Adds or overwrites an entity in the store by its ID."""
         self.entities[entity.id] = entity
         return entity
 
@@ -207,7 +215,7 @@ class MemoryStore(BaseModel):
         return self.entities.pop(entity_id, None)
 
     def find_entities_by_name(self, name: str) -> list[Entity]:
-        """Case-insensitive search by name or alias."""
+        """Searches both names and aliases, case-insensitively."""
         needle = name.lower().strip()
         return [
             e for e in self.entities.values()
@@ -215,7 +223,7 @@ class MemoryStore(BaseModel):
             or any(needle in a.lower() for a in e.aliases)
         ]
 
-    # ── Claim helpers ─────────────────────────────────────────────────────
+    # ── Helpers for working with claims ─────────────────────────────────
     def add_claim(self, claim: Claim) -> Claim:
         self.claims[claim.id] = claim
         return claim
@@ -227,26 +235,26 @@ class MemoryStore(BaseModel):
         return self.claims.pop(claim_id, None)
 
     def get_claims_for_entity(self, entity_id: str) -> list[Claim]:
-        """Return all claims where entity is subject or object."""
+        """Returns every claim that involves this entity, whether as subject or object."""
         return [
             c for c in self.claims.values()
             if c.subject_id == entity_id or c.object_id == entity_id
         ]
 
     def get_claims_between(self, entity_a: str, entity_b: str) -> list[Claim]:
-        """Return claims linking two specific entities."""
+        """Finds all claims that link these two specific entities together."""
         return [
             c for c in self.claims.values()
             if {c.subject_id, c.object_id} == {entity_a, entity_b}
         ]
 
-    # ── Merge log ─────────────────────────────────────────────────────────
+    # ── Append to the audit trail ────────────────────────────────────────
     def add_merge(self, record: MergeRecord) -> None:
         self.merge_log.append(record)
 
-    # ── Serialisation ─────────────────────────────────────────────────────
+    # ── Read/write the store to and from JSON ───────────────────────────
     def to_snapshot(self) -> MemoryGraphSnapshot:
-        """Convert to a flat MemoryGraphSnapshot for JSON serialisation."""
+        """Flattens the store into a snapshot that's easy to write to disk."""
         return MemoryGraphSnapshot(
             entities=list(self.entities.values()),
             claims=list(self.claims.values()),
@@ -258,7 +266,7 @@ class MemoryStore(BaseModel):
 
     @classmethod
     def from_snapshot(cls, snap: MemoryGraphSnapshot) -> "MemoryStore":
-        """Build a MemoryStore from a flat snapshot."""
+        """Rebuilds a MemoryStore from a snapshot that was loaded from disk."""
         return cls(
             entities={e.id: e for e in snap.entities},
             claims={c.id: c for c in snap.claims},
@@ -269,18 +277,18 @@ class MemoryStore(BaseModel):
         )
 
     def serialize(self) -> dict:
-        """Return a JSON-serialisable dict."""
+        """Returns the whole store as a plain dict ready for json.dump()."""
         return self.to_snapshot().model_dump()
 
     @classmethod
     def deserialize(cls, data: dict) -> "MemoryStore":
-        """Load from a dict (e.g. from JSON file)."""
+        """Loads a MemoryStore from a dict — typically the result of json.load()."""
         snap = MemoryGraphSnapshot(**data)
         return cls.from_snapshot(snap)
 
-    # ── Orphan cleanup ────────────────────────────────────────────────────
+    # ── Remove entities that no claim points to anymore ─────────────────
     def remove_orphan_entities(self) -> int:
-        """Remove entities not referenced by any claim."""
+        """Deletes any entity that isn't referenced by at least one claim."""
         referenced = set()
         for c in self.claims.values():
             referenced.add(c.subject_id)

@@ -1,4 +1,4 @@
-# Layer10 - Grounded Long-Term Memory System
+# Layer10 - Memory System
 
 A pipeline and interactive visualization tool for extracting, deduplicating, and querying a grounded long-term memory graph from the Enron email corpus. It uses local LLMs (via Ollama) and a rule-based extraction fallback to build a robust, structured knowledge graph of entities and claims, which are strictly grounded to the original source text.
 
